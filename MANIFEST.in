@@ -1,0 +1,5 @@
+include native/assglass.cpp
+include native/build.py
+include README.md
+include examples/config.yaml
+recursive-include examples *.ass *.json *.yaml

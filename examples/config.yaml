@@ -1,0 +1,33 @@
+# Actor / Name 字段区分大小写，按原字符串开头匹配。
+marker_prefix: bgblur
+
+defaults:
+  mode: box
+  blur_sigma: 40
+  feather_sigma: 12
+  strength: 1.0
+  opacity_threshold: 0.5
+  padding_x: 28
+  padding_y: 16
+  corner_radius: 24
+  include_types: [character, outline]
+
+selection:
+  backend: alpha
+  allow_merged_box: false
+
+output:
+  burn_subtitles: true
+
+encoder:
+  codec: libx264
+  rate_control: crf
+  options:
+    crf: 18
+    preset: veryslow
+    # 其余编码选项继承用户默认；可改为 fast 以缩短试片时间。
+
+transport:
+  max_in_flight_frames: 4
+  max_in_flight_bytes: 67108864
+  debug_mask_max_bytes: 1073741824

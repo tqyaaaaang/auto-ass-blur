@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "assglass"
+version = "0.1.0"
+description = "Native, bounded ASS subtitle background Gaussian blur and single-pass encoding"
+requires-python = ">=3.8"
+dependencies = ["PyYAML>=5.4"]
+
+[project.optional-dependencies]
+test = ["pytest>=6.2"]
+
+[project.scripts]
+assglass = "assglass.cli:main"
+
+[tool.setuptools]
+packages = ["assglass"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["integration: real FFmpeg and native libass tests"]
