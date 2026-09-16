@@ -25,7 +25,7 @@ INTEGER_KEYS = {"padding_x", "padding_y", "corner_radius", "expand_x", "expand_y
 FLOAT_KEYS = {"feather_sigma", "strength", "blur_sigma", "opacity_threshold"}
 _NUMBER = re.compile(r"-?(?:\d+(?:\.\d*)?|\.\d+)\Z")
 _SECTION_DEFAULTS = {
-    "selection": {"backend": "alpha", "alpha_unsafe": "error", "allow_merged_box": False, "grouping": "merged"},
+    "selection": {"backend": "auto", "alpha_unsafe": "error", "allow_merged_box": False, "grouping": "per-event"},
     "render": {"fonts_dir": None, "target_width": 1920, "target_height": 1080,
                "adapter_profile": "ffmpeg-ass-verified", "manifest_output": None},
     "video": {"profile": "auto", "unsupported": "error"},
@@ -114,6 +114,10 @@ def load_project(path) -> dict:
 def _value(key, value, from_text=False):
     if value is None:
         raise ConfigError("{} cannot be null; remove the key to inherit".format(key))
+    if key == "group":
+        if not isinstance(value, str) or not re.fullmatch(r"[\w.-]{1,128}", value):
+            raise ConfigError("group must contain 1-128 letters, digits, underscores, dots or hyphens")
+        return value
     if key in INTEGER_KEYS | FLOAT_KEYS:
         if isinstance(value, bool) or not isinstance(value, (str, int, float)):
             raise ConfigError("{} must be a finite number".format(key))
@@ -163,7 +167,7 @@ def normalize_overrides(items, *, scope="row", from_text=False) -> dict:
         canonical = ALIASES.get(key, key)
         if canonical == "blur_sigma" and scope != "defaults":
             raise ConfigError("{} is task-global only and cannot be overridden per row".format(key))
-        if canonical not in MASK_KEYS | ({"blur_sigma"} if scope == "defaults" else set()):
+        if canonical not in MASK_KEYS | ({"blur_sigma"} if scope == "defaults" else {"group"}):
             raise ConfigError("Unknown {} parameter {!r}".format(scope, key))
         if canonical in result:
             raise ConfigError("Duplicate canonical key {!r} (including aliases)".format(canonical))
@@ -288,14 +292,18 @@ def resolve_config(project=None, cli_defaults: Sequence[str] = (), blur_sigma=No
             raise ConfigError("Unknown {} keys: {}".format(name, ", ".join(sorted(set(configured) - set(builtin)))))
         sections[name] = _merge_dict(builtin, configured)
     selection = sections["selection"]
-    if selection["backend"] == "auto":
-        selection["backend"] = "alpha"
-    if selection["backend"] not in ("alpha", "event-images"):
+    if selection["backend"] not in ("auto", "alpha", "event-images"):
         raise ConfigError("Unknown selection backend {!r}".format(selection["backend"]))
     if selection["alpha_unsafe"] != "error":
         raise ConfigError("selection.alpha_unsafe only permits 'error'; no unsafe bypass exists")
     if type(selection["allow_merged_box"]) is not bool:
         raise ConfigError("selection.allow_merged_box must be boolean")
+    # The existing opt-in flag remains an explicit request for the legacy shared box.
+    # Reject contradictory input instead of silently overriding independent grouping.
+    if selection["allow_merged_box"]:
+        if project.get("selection", {}).get("grouping") == "per-event":
+            raise ConfigError("allow_merged_box conflicts with grouping=per-event")
+        selection["grouping"] = "merged"
     if selection["grouping"] not in ("merged", "per-event"):
         raise ConfigError("selection.grouping must be merged or per-event")
     if sections["video"]["unsupported"] != "error":
@@ -328,6 +336,7 @@ def resolve_config(project=None, cli_defaults: Sequence[str] = (), blur_sigma=No
 def resolve_event_config(config: AppConfig, overrides: MarkerOverrides) -> ResolvedMaskConfig:
     values = dict(config.mask_defaults)
     values.update(overrides.values)
+    values.pop("group", None)  # Selection metadata, never a mask parameter or pixel dimension.
     mode = values.get("mode", "box")
     if mode != "box":
         raise ConfigError("Mask mode {!r} is not implemented; only box is available".format(mode))
@@ -339,7 +348,7 @@ def resolve_event_config(config: AppConfig, overrides: MarkerOverrides) -> Resol
         values.pop(key, None)
     sources = {key: "builtin" for key in MASK_KEYS}
     sources.update(config.mask_sources)
-    sources.update(overrides.sources)
+    sources.update({key: source for key, source in overrides.sources.items() if key != "group"})
     unscaled = ResolvedMaskConfig(**values, sources=sources)
     scale = config.render["target_height"] / 1080.0
     actual = {key: int(math.floor(getattr(unscaled, key) * scale + 0.5)) for key in INTEGER_KEYS}

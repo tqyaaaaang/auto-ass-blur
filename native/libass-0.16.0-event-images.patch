@@ -1,0 +1,107 @@
+--- a/libass/ass.h
++++ b/libass/ass.h
+@@ -786,6 +786,31 @@
+ #undef ASS_DEPRECATED
+ #undef ASS_DEPRECATED_ENUM
+ 
++/* Assglass read-only event export, extension ABI 1 (not upstream libass).
++ * The callback runs after every layer's collision correction, before event
++ * image chains are joined. Views and bitmap storage are valid only during the
++ * callback. Event indices address the unmodified ASS_Track.events array.
++ * Never reenter, mutate or destroy the renderer/track from this callback.
++ * A descriptor-allocation failure reports event_index=-1, images=NULL and
++ * image_count=SIZE_MAX; standard rendering and change detection still finish.
++ * No callback means no additional allocation or bitmap work.
++ */
++typedef struct AssglassImageView {
++    int type;
++    int dst_x, dst_y;
++    int w, h, stride;
++    uint32_t color;
++    const uint8_t *bitmap;
++} AssglassImageView;
++
++typedef void (*AssglassEventImagesCallback)(
++    void *opaque, const ASS_Track *track, int event_index,
++    const AssglassImageView *images, size_t image_count);
++
++unsigned assglass_event_export_abi_version(void);
++void assglass_set_event_images_callback(ASS_Renderer *renderer,
++    AssglassEventImagesCallback callback, void *opaque);
++
+ #ifdef __cplusplus
+ }
+ #endif
+--- a/libass/ass_render.h
++++ b/libass/ass_render.h
+@@ -304,6 +304,9 @@
+     EventImages *eimg;          // temporary buffer for sorting rendered events
+     int eimg_size;              // allocated buffer size
+ 
++    AssglassEventImagesCallback assglass_event_callback;
++    void *assglass_event_opaque;
++
+     // frame-global data
+     int width, height;          // screen dimensions
+     int orig_height;            // frame height ( = screen height - margins )
+--- a/libass/ass_render.c
++++ b/libass/ass_render.c
+@@ -3207,6 +3207,34 @@
+     if (cnt > 0)
+         fix_collisions(priv, last, priv->eimg + cnt - last);
+ 
++    // Observe final event coordinates without changing the public image chain.
++    if (priv->assglass_event_callback) {
++        for (int i = 0; i < cnt; i++) {
++            size_t count = 0;
++            for (ASS_Image *im = priv->eimg[i].imgs; im; im = im->next)
++                count++;
++            AssglassImageView *views = NULL;
++            if (count <= SIZE_MAX / sizeof(*views))
++                views = count ? malloc(count * sizeof(*views)) : NULL;
++            if (count && !views) {
++                priv->assglass_event_callback(priv->assglass_event_opaque,
++                                             track, -1, NULL, SIZE_MAX);
++                break;
++            }
++            size_t j = 0;
++            for (ASS_Image *im = priv->eimg[i].imgs; im; im = im->next) {
++                views[j++] = (AssglassImageView) {
++                    .type = im->type, .dst_x = im->dst_x, .dst_y = im->dst_y,
++                    .w = im->w, .h = im->h, .stride = im->stride,
++                    .color = im->color, .bitmap = im->bitmap,
++                };
++            }
++            priv->assglass_event_callback(priv->assglass_event_opaque, track,
++                (int)(priv->eimg[i].event - track->events), views, count);
++            free(views);
++        }
++    }
++
+     // concat lists
+     ASS_Image **tail = &priv->images_root;
+     for (int i = 0; i < cnt; i++) {
+@@ -3256,3 +3284,15 @@
+         free(priv);
+     } while (img);
+ }
++
++unsigned assglass_event_export_abi_version(void)
++{
++    return 1;
++}
++
++void assglass_set_event_images_callback(ASS_Renderer *renderer,
++    AssglassEventImagesCallback callback, void *opaque)
++{
++    renderer->assglass_event_callback = callback;
++    renderer->assglass_event_opaque = opaque;
++}
+--- a/libass/libass.sym
++++ b/libass/libass.sym
+@@ -44,3 +44,5 @@
+ ass_set_selective_style_override
+ ass_set_check_readorder
+ ass_track_set_feature
++assglass_event_export_abi_version
++assglass_set_event_images_callback

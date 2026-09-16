@@ -2,7 +2,7 @@
 
 `assglass` 根据 ASS 字幕的实际渲染位置，模糊标记字幕后方的视频，再将完整字幕烧入视频。背景处理和字幕烧录在同一次视频编码中完成，字幕字形本身保持清晰。
 
-实现以 [`PLAN/ass_bgblur_technical_design_v1.10.md`](PLAN/ass_bgblur_technical_design_v1.10.md) 的第一阶段为基础：完整 libass track 分析、圆角矩形背景、原生 YUV420 权重和流式 FFmpeg 合成。按本次需求，**标记使用 Actor 字段（ASS 文件中的 `Name`），按可配置前缀匹配，默认 `bgblur`**；不使用设计文档旧方案中的 Effect 精确匹配。
+实现以 [`PLAN/ass_bgblur_technical_design_v1.10.md`](PLAN/ass_bgblur_technical_design_v1.10.md) 为基础：完整 libass track 分析、圆角矩形背景、原生 YUV420 权重和流式 FFmpeg 合成，并已加入 EventImages 逐事件导出与独立字幕组。**标记使用 Actor 字段（ASS 文件中的 `Name`），按可配置前缀匹配，默认 `bgblur`**；不使用 Effect 精确匹配。
 
 ## 使用前准备
 
@@ -12,14 +12,15 @@ Ubuntu / Debian 的系统依赖：
 
 ```bash
 sudo apt update
-sudo apt install python3 python3-venv python3-dev build-essential pkg-config libass-dev ffmpeg
+sudo apt install python3 python3-venv python3-dev build-essential pkg-config libass-dev ffmpeg \
+  curl xz-utils patch libfreetype6-dev libfribidi-dev libharfbuzz-dev libfontconfig1-dev libx264-dev
 ```
 
 macOS 的系统依赖：
 
 ```bash
 xcode-select --install
-brew install python pkg-config libass ffmpeg
+brew install python pkg-config libass ffmpeg freetype fribidi harfbuzz x264
 ```
 
 在项目目录安装：
@@ -28,11 +29,18 @@ brew install python pkg-config libass ffmpeg
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
+# 下载经 SHA-256 校验的固定版本源码；只安装到本项目 .tools
+sh scripts/build_libass.sh
+sh scripts/build_ffmpeg.sh
 python -m pip install -e '.[test]'
 assglass --help
 ```
 
 安装会编译 C++ 原生核心；开发时也可用 `python native/build.py` 手动重建。若提示找不到 libass，先检查 `pkg-config --modversion libass`；若有多套 FFmpeg/libass，请先统一运行环境，再运行测试。更换 FFmpeg、libass 或字体后，应重新做集成验证。当前可检查动态依赖的 Linux/macOS 构建是运行范围；静态内置 libass 的下载版 FFmpeg 不能通过共享库一致性检查。
+
+独立背景框需要项目扩展的 **libass 0.16.0 / EventImages ABI 1**。构建脚本应用仓库内的只读导出补丁，安装到 `.tools/libass-event-images`；FFmpeg 与原生核心随后链接同一个私有库。补丁在字幕碰撞调整完成后读取每个事件的图像，保留标准渲染输出，不修改系统 libass。若先安装了 Python 包、后来才构建扩展，请重新运行 `python -m pip install -e '.[test]'`。
+
+默认 `backend=auto` 优先使用可用的 EventImages。没有扩展时可显式选择旧的 `--backend alpha --grouping merged`；请求独立分组时会提示安装扩展，绝不会自动把独立框退化为共同大框。
 
 程序启动会测试 FFmpeg `maskedmerge` 的真实数值行为。本机原有 FFmpeg 5.0.1 在权重 255 时未精确输出模糊分支，会被拒绝，不能仅凭“装有 FFmpeg”跳过检查。项目可使用私有 FFmpeg 6.1.1，避免修改系统安装：
 
@@ -84,6 +92,36 @@ assglass input.mp4 subtitle.ass -o output.mp4 --sidecar selected.json
 ```
 
 sidecar 绑定完整 ASS 的 SHA-256；编辑、重排或重新保存 ASS 后，需要重新生成 sidecar。Actor 与 sidecar 同时选择某行只计算一次，显式参数冲突会报错。
+
+## 独立背景框与多层字幕分组
+
+默认 `grouping=per-event`：每条标记 Dialogue 都有独立背景框。同时出现的两句话分别求范围、添加外扩和羽化，最后按像素最大值合并遮罩；中间的空白不会被一个共同矩形填满，重叠处也不会反复叠加模糊。
+
+同一句字幕由正文、白描边、黑描边等多行构成时，在这些行的 Actor 中使用相同的 `group`：
+
+```text
+bgblur{group=comment}   # “说不定这段就被剪掉了”
+bgblur{group=why}       # “为啥——！”正文层
+bgblur{group=why}       # “为啥——！”白描边层
+bgblur{group=why}       # “为啥——！”黑描边层
+```
+
+填写 Actor 时只填写左侧标记，不包含示例注释。组名区分大小写，可含中英文、数字、下划线、点和连字符，长度1～128。未写 `group` 的每一行独立；`bgblur_why` 仍只是前缀匹配，不会隐式创建组。`group` 也可放进 sidecar 每条事件的 `overrides`，但不能作为全局 mask 默认值。
+
+同组的当前活动事件先合并字形与描边图像，再求一个框，因此多层样式不会丢失外沿。不同组可同时使用不同的 padding、feather、strength、threshold 等参数；同组同时活动的行必须具有相同的有效参数，冲突会在编码前指出。时间不重叠的行可以复用组名并采用不同参数。
+
+```bash
+# 默认独立框；必要时显式选择后端和分组
+assglass input.mp4 subtitle.ass -o output.mp4 --backend event-images --grouping per-event
+
+# 切换旧项目的共同大框配置为独立框
+assglass input.mp4 subtitle.ass -o output.mp4 --config project.yaml --grouping per-event
+
+# 仅在确实需要整组一个大矩形时使用旧模式
+assglass input.mp4 subtitle.ass -o output.mp4 --allow-merged-box
+```
+
+`--allow-merged-box` 是旧模式开关，会选择 `grouping=merged`；所有同时出现的标记必须参数相同。含显式 `group` 标记的字幕不能进入 merged 模式，避免静默丢失分组含义。
 
 | 参数 | 默认值 | 作用 |
 | --- | --- | --- |
@@ -144,6 +182,9 @@ assglass input.mp4 subtitle.ass -o output.mp4 --check-only
 
 ```yaml
 marker_prefix: bgblur
+selection:
+  backend: auto
+  grouping: per-event
 defaults:
   blur_sigma: 40
   feather_sigma: 12
@@ -176,13 +217,13 @@ assglass input.mp4 subtitle.ass -o output.mp4 --config examples/config.yaml
 
 其他分辨率、帧率、VFR、HDR、10 位、不同色度位置、非方形像素、旋转或缺失关键色彩标签的输入会被拒绝。程序不会自动补帧、改色彩标签或猜测视频格式。ASS 文件应为严格 UTF-8，可带文件头 BOM。
 
-当前实现启用 `alpha` 选择后端和 `box` 圆角矩形形状。`organic`、EventImages、逐事件独立并发框和隐藏字形几何恢复是后续功能，当前请求会明确报错。
+当前实现包括 `event-images` 与旧的 `alpha` 选择后端，形状为 `box` 圆角矩形。`organic` 不规则形状、背景强度连续跟随字幕透明度、隐藏字形几何恢复等仍未实现。
 
-任意时刻默认只能有一个标记事件；非标记事件仍保留在完整 track 中参与自动碰撞与排版。确实需要多个同时出现的标记共用一个大框时，可加 `--allow-merged-box`，且它们的有效外观参数必须相同。不同时间、不重叠的标记可以使用不同参数。
+EventImages 渲染完整原始 ASS，所有标记与未标记事件继续参与自动碰撞、特效和逐帧历史；只在渲染之后按真实事件身份提取目标图像。支持多组同时活动的独立背景。源 ASS 的 Dialogue 索引还会与 libass 的冻结事件数组核对，不能安全对应时会报错，不会猜测归属。
 
 完全透明或有效不透明度不超过 `opacity_threshold` 的像素不会贡献背景几何。达到阈值要求的部分按几何生成指定强度的背景，背景强度不再乘以字幕的透明度。背景从 libass 已裁剪且通过阈值的字形范围向外扩张，因此 padding 和羽化可能越过原 `clip` 边界。
 
-为保留其他字幕的碰撞上下文，分析副本会隐藏非标记行。安全的整行 alpha/reset 等覆盖会按规则规范化；无法保证隐藏或布局保持的逐字透明度、部分 transform / fade 组合会在编码前报错，并指出相关事件。原 ASS 文件不会因此被改写。
+EventImages 不再改写任何字幕透明度，因此完整 ASS 中未标记的 Effect=fx、卡拉 OK、复杂 transform 等可交给 libass 原样渲染，不受旧 Alpha 隐藏规则限制。旧 `alpha` 后端仍只支持受限的 alpha/reset 规范化；无法保证隐藏或布局保持的组合会在编码前报错。无论使用哪种后端，都不修改原 ASS 文件。
 
 ## 常见问题
 
@@ -190,7 +231,9 @@ assglass input.mp4 subtitle.ass -o output.mp4 --config examples/config.yaml
 
 **有背景框，但看不到毛玻璃：**原 ASS 的 `BorderStyle=3`、不透明 drawing 或其他底板可能盖住模糊结果。程序保留原样式；需要在 ASS 中调整底板透明度或删除不需要的底板。
 
-**多行同时出现时报错：**普通未标记行可以与标记行同时出现。冲突指多个标记事件时间重叠。调整时间、取消不需要的标记，或在接受共同大框的前提下使用 `--allow-merged-box`。
+**多行同时出现时报错：**独立框需要 EventImages 扩展。若已启用它，检查是否把不同外观参数的重叠行写进了同一 `group`；不同组可以采用不同参数。旧 Alpha 模式仍需要在接受共同大框的前提下显式启用 `--allow-merged-box`。
+
+**提示 helper 与 FFmpeg 使用不同 libass：**在构建私有 libass 后重新运行 `sh scripts/build_ffmpeg.sh`，再重建原生核心／重新安装 Python 包。程序会验证真实库路径、版本和文件摘要；不要通过跳过检查混用系统 FFmpeg 与私有 helper。
 
 **编码较慢：**全画面模糊和默认 `veryslow` 编码都有开销。可先用 `--preset fast` 对短片验证效果，再决定正式输出设置。输入码率较低并不意味着模糊或编码计算量很低。
 
@@ -208,9 +251,9 @@ ASSGLASS_TEST_FFPROBE=/path/to/ffprobe \
 sh scripts/test_matrix.sh /path/to/ffmpeg6/bin /path/to/ffmpeg8/bin
 ```
 
-测试包含配置与 ASS 解析、原生 mask 数值、透明度筛选、视频格式和时间检查，以及依赖真实 FFmpeg/libass 的短片集成测试。集成测试生成合成 1080p60 素材，不需要下载视频。
+测试包含配置与 ASS 解析、原生 mask 数值、透明度筛选、逐事件归属、独立／命名组、碰撞历史一致性、回调失败与所有权、视频格式和时间检查，以及依赖真实 FFmpeg/libass 的短片集成测试。集成测试生成合成 1080p60 素材，不需要下载视频。
 
-本次本地验证使用 macOS、FFmpeg 6.1.1、共享 libass 0.16.0 和 x264 core 164。最近一次完整测试结果为 **131 passed**（无跳过），包含 60000/1001 fps 的真实压制与精确时间戳验收，以及 opacity_threshold 的严格边界、颜色透明度、图层合并和真实 libass 模糊外沿回归。12 帧真实压制检查已覆盖：两种烧录模式的 mask / ledger 一致、标记起止与透明切换零帧偏差、未标记字幕正常烧入且不泄漏背景、三平面零 mask、精确输出时间戳，以及从输出 x264 SEI 核对完整默认编码参数。另验证了生产滤镜在编码前的全零/全一权重端点逐字节正确、日志失败不会导致 pipe 死锁、wheel 独立安装，以及 AAC 默认复制的 10 个音频包哈希一致。本机 FFmpeg 5.0.1 未通过权重端点自检，已作为拒绝环境处理。
+本次本地验证使用 macOS、FFmpeg 6.1.1、私有共享 libass 0.16.0（EventImages ABI 1）和 x264 core 164。最近一次完整测试结果为 **149 passed**（无跳过），包含 60000/1001 fps 的真实压制与精确时间戳验收，以及 opacity_threshold 的严格边界、颜色透明度、图层合并和真实 libass 模糊外沿回归。12 帧真实压制检查已覆盖：两种烧录模式的 mask / ledger 一致、标记起止与透明切换零帧偏差、未标记字幕正常烧入且不泄漏背景、三平面零 mask、精确输出时间戳，以及从输出 x264 SEI 核对完整默认编码参数。另验证了生产滤镜在编码前的全零/全一权重端点逐字节正确、日志失败不会导致 pipe 死锁、wheel 独立安装，以及 AAC 默认复制的 10 个音频包哈希一致。本机 FFmpeg 5.0.1 未通过权重端点自检，已作为拒绝环境处理。
 
 FFmpeg 5～9 是设计兼容目标，不代表任意发行构建均已认证。本地验证结果只适用于记录的工具链；Ubuntu 版本矩阵、真实长片资源压力和全部字体组合需要在目标环境继续测试。短片通过不等于已完成一小时视频压力验收，也不代表承诺实时处理速度。
 

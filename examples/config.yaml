@@ -13,7 +13,8 @@ defaults:
   include_types: [character, outline]
 
 selection:
-  backend: alpha
+  backend: auto
+  grouping: per-event
   allow_merged_box: false
 
 output:

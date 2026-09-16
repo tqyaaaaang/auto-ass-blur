@@ -7,6 +7,14 @@ set -eu
 assglass_script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 assglass_project_dir=$(CDPATH= cd -- "$assglass_script_dir/.." && pwd)
 assglass_destination="$assglass_project_dir/.tools/ffmpeg-6.1.1"
+assglass_event_prefix="$assglass_project_dir/.tools/libass-event-images"
+if [ -f "$assglass_event_prefix/lib/pkgconfig/libass.pc" ]; then
+  PKG_CONFIG_PATH="$assglass_event_prefix/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+  export PKG_CONFIG_PATH
+  # The macOS install name is absolute. Linux requires an explicit runtime path.
+  LDFLAGS="${LDFLAGS:-} -Wl,-rpath,$assglass_event_prefix/lib"
+  export LDFLAGS
+fi
 assglass_build_dir=$(mktemp -d "${TMPDIR:-/tmp}/assglass-ffmpeg.XXXXXX")
 trap 'rm -rf -- "$assglass_build_dir"' EXIT HUP INT TERM
 

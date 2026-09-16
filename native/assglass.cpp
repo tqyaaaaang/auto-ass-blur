@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -50,6 +51,38 @@ struct Images {
     Charge charge; std::vector<Plane> planes; int changed=0;
     explicit Images(BudgetRef b):charge(std::move(b)){}
 };
+// Keep this private ABI declaration independent from patched headers: the
+// bridge must compile/load with an ordinary system libass as well.
+struct EventImageView {
+    int type, dst_x, dst_y, w, h, stride;
+    uint32_t color;
+    const uint8_t* bitmap;
+};
+using EventCallback=void(*)(void*,const ASS_Track*,int,const EventImageView*,size_t);
+struct EventExtension {
+    unsigned abi=0;
+    void (*set)(ASS_Renderer*,EventCallback,void*)=nullptr;
+    EventExtension() {
+        Dl_info info{};
+        if(!dladdr(reinterpret_cast<void*>(&ass_library_version),&info)||!info.dli_fname)return;
+        void* handle=dlopen(info.dli_fname,RTLD_NOW|RTLD_LOCAL);
+        if(!handle)return;
+        auto version=reinterpret_cast<unsigned(*)()>(dlsym(handle,"assglass_event_export_abi_version"));
+        set=reinterpret_cast<decltype(set)>(dlsym(handle,"assglass_set_event_images_callback"));
+        if(version&&set)abi=version();
+        if(abi!=1)set=nullptr;
+        // Retain the exact library handle for the process lifetime.
+    }
+};
+EventExtension& event_extension(){static EventExtension extension;return extension;}
+struct EventFrame {
+    Charge charge;std::vector<int> indices;std::vector<std::shared_ptr<Images>> images;
+    int changed=0;
+    EventFrame(BudgetRef b,const std::vector<int>& selected):charge(b) {
+        charge.add(selected.size()*(sizeof(int)+sizeof(std::shared_ptr<Images>)));
+        indices=selected;images.resize(selected.size());
+    }
+};
 struct Mask {
     Charge charge; int x=0,y=0,w=0,h=0; std::vector<float> pixels;
     explicit Mask(BudgetRef b):charge(std::move(b)){}
@@ -88,9 +121,34 @@ void copy_plane(Images& out,int x,int y,int w,int h,int stride,uint32_t color,in
 struct Session {
     BudgetRef budget; ASS_Library* library=nullptr;ASS_Renderer* renderer=nullptr;ASS_Track* track=nullptr;
     std::string logs; std::mutex mutex;
+    bool event_mode=false;std::vector<int> selected;std::unique_ptr<Charge> selection_charge;
+    EventFrame* collector=nullptr;std::exception_ptr callback_error;
     explicit Session(BudgetRef b):budget(std::move(b)){}
     ~Session(){if(track)ass_free_track(track);if(renderer)ass_renderer_done(renderer);if(library)ass_library_done(library);}
 };
+void event_callback(void* opaque,const ASS_Track* track,int index,const EventImageView* images,size_t count) noexcept {
+    auto& s=*static_cast<Session*>(opaque);
+    if(s.callback_error)return;
+    try {
+        if(!s.collector||track!=s.track)throw std::runtime_error("EventImages callback track/collector mismatch");
+        if(index<0||index>=track->n_events||count==std::numeric_limits<size_t>::max())
+            throw std::runtime_error("libass EventImages descriptor allocation or identity failure");
+        auto it=std::lower_bound(s.selected.begin(),s.selected.end(),index);
+        if(it==s.selected.end()||*it!=index)return;
+        const size_t slot=size_t(it-s.selected.begin());
+        if(s.collector->images[slot])throw std::runtime_error("duplicate EventImages callback index");
+        auto result=std::make_shared<Images>(s.budget);
+        for(size_t i=0;i<count;i++) {
+            const auto& im=images[i];
+            copy_plane(*result,im.dst_x,im.dst_y,im.w,im.h,im.stride,im.color,im.type,im.bitmap,std::numeric_limits<size_t>::max());
+        }
+        s.collector->images[slot]=std::move(result);
+    } catch(...) {
+        // Store the exception without allocation. Never unwind through libass;
+        // the standard render finishes before the outer C ABI reports failure.
+        s.callback_error=std::current_exception();
+    }
+}
 void log_callback(int level,const char* fmt,va_list args,void* data){
     if(level>6)return;auto* s=static_cast<Session*>(data);char text[2048];vsnprintf(text,sizeof(text),fmt,args);
     if(s->logs.size()<65536){s->logs+=text;s->logs+='\n';}
@@ -141,6 +199,7 @@ void ag_budget_free(void* p){delete static_cast<BudgetRef*>(p);}
 size_t ag_budget_used(void* p){return p?unwrap<Budget>(p)->used:0;}
 size_t ag_budget_peak(void* p){return p?unwrap<Budget>(p)->peak:0;}
 int ag_libass_version(){return ass_library_version();}
+unsigned ag_event_export_abi(){return event_extension().abi;}
 const char* ag_libass_path(){static std::string path=[](){Dl_info info{};if(dladdr(reinterpret_cast<void*>(&ass_library_version),&info)&&info.dli_fname)return std::string(info.dli_fname);return std::string("unknown");}();return path.c_str();}
 int64_t ag_time_ms(int64_t pts,int64_t num,int64_t den){volatile double tb=double(num)/double(den);volatile double seconds=double(pts)*tb;volatile double millis=seconds*1000.0;return int64_t(millis);}
 void* ag_session_new(const char* data,size_t size,int w,int h,const char* fonts,void* budget){BEGIN
@@ -164,7 +223,53 @@ void* ag_session_render(void* p,int64_t ms){BEGIN
     auto result=std::make_shared<Images>(s.budget);ASS_Image* im=ass_render_frame(s.renderer,s.track,ms,&result->changed);
     for(;im;im=im->next)copy_plane(*result,im->dst_x,im->dst_y,im->w,im->h,im->stride,im->color,int(im->type),im->bitmap,std::numeric_limits<size_t>::max());
     return new Ref<Images>(std::move(result));END_NULL}
+int ag_session_event_count(void* p){return static_cast<Session*>(p)->track->n_events;}
+int ag_session_event_metadata(void* p,int index,int64_t* timing,int* fields,const char** strings){BEGIN
+    auto& s=*static_cast<Session*>(p);
+    if(index<0||index>=s.track->n_events)throw std::runtime_error("invalid event metadata index");
+    const auto& event=s.track->events[index];
+    timing[0]=event.Start;timing[1]=event.Duration;
+    fields[0]=event.Layer;fields[1]=event.MarginL;fields[2]=event.MarginR;fields[3]=event.MarginV;
+    strings[0]=event.Style>=0&&event.Style<s.track->n_styles?s.track->styles[event.Style].Name:"";
+    strings[1]=event.Name;strings[2]=event.Text;strings[3]=event.Effect;
+    return 0;END_INT}
+int ag_session_enable_events(void* p,const int* indices,size_t count){BEGIN
+    auto& s=*static_cast<Session*>(p);std::lock_guard<std::mutex> lock(s.mutex);
+    if(!event_extension().set)throw std::runtime_error("EventImages requires libass extension ABI 1; run scripts/build_libass.sh and rebuild FFmpeg/native bridge");
+    if(s.event_mode)throw std::runtime_error("EventImages selection is immutable");
+    if(count>size_t(s.track->n_events))throw std::runtime_error("too many selected event indices");
+    s.selection_charge=std::make_unique<Charge>(s.budget);s.selection_charge->add(count*sizeof(int));
+    s.selected.assign(indices,indices+count);std::sort(s.selected.begin(),s.selected.end());
+    for(size_t i=0;i<count;i++)if(s.selected[i]<0||s.selected[i]>=s.track->n_events||(i&&s.selected[i]==s.selected[i-1]))
+        throw std::runtime_error("selected event indices must be distinct valid track indices");
+    event_extension().set(s.renderer,event_callback,&s);s.event_mode=true;return 0;END_INT}
+void* ag_session_render_events(void* p,int64_t ms){BEGIN
+    if(!p)throw std::runtime_error("render session is closed");auto& s=*static_cast<Session*>(p);std::lock_guard<std::mutex> lock(s.mutex);
+    if(!s.event_mode)throw std::runtime_error("EventImages callback is not enabled");
+    auto result=std::make_unique<EventFrame>(s.budget,s.selected);
+    s.callback_error=nullptr;s.collector=result.get();
+    ass_render_frame(s.renderer,s.track,ms,&result->changed);
+    s.collector=nullptr;
+    if(s.callback_error)std::rethrow_exception(s.callback_error);
+    return result.release();END_NULL}
+void ag_event_frame_free(void* p){delete static_cast<EventFrame*>(p);}
+int ag_event_frame_changed(void* p){return static_cast<EventFrame*>(p)->changed;}
+void* ag_event_frame_take(void* p,int index,void* budget){BEGIN
+    if(!p)throw std::runtime_error("EventImages frame is released");auto& frame=*static_cast<EventFrame*>(p);
+    auto it=std::lower_bound(frame.indices.begin(),frame.indices.end(),index);
+    if(it==frame.indices.end()||*it!=index)throw std::runtime_error("event index was not selected");
+    auto& image=frame.images[size_t(it-frame.indices.begin())];
+    auto result=image?std::move(image):std::make_shared<Images>(get_budget(budget));
+    result->changed=frame.changed;
+    return new Ref<Images>(std::move(result));END_NULL}
 void* ag_images_new(void* budget){BEGIN return new Ref<Images>(std::make_shared<Images>(get_budget(budget)));END_NULL}
+void* ag_images_combine(void** images,size_t count,void* budget){BEGIN
+    auto result=std::make_shared<Images>(get_budget(budget));
+    for(size_t i=0;i<count;i++) {
+        const auto& source=*unwrap<Images>(images[i]);result->changed=std::max(result->changed,source.changed);
+        for(const auto& im:source.planes)copy_plane(*result,im.x,im.y,im.w,im.h,im.w,im.color,im.type,im.pixels.data(),im.pixels.size());
+    }
+    return new Ref<Images>(std::move(result));END_NULL}
 int ag_images_append(void* p,int x,int y,int w,int h,int stride,uint32_t color,int type,const uint8_t* data,size_t length){BEGIN copy_plane(*unwrap<Images>(p),x,y,w,h,stride,color,type,data,length);return 0;END_INT}
 void* ag_images_retain(void* p){BEGIN return new Ref<Images>(unwrap<Images>(p));END_NULL}
 void ag_images_free(void* p){delete static_cast<Ref<Images>*>(p);}

@@ -39,6 +39,7 @@ def parser():
     p.add_argument("--sidecar", type=Path)
     p.add_argument("--allow-merged-box", action="store_true", default=None)
     p.add_argument("--backend", choices=["auto", "alpha", "event-images"])
+    p.add_argument("--grouping", choices=["per-event", "merged"], help="默认逐行/命名组独立背景；merged 为共同大框")
     p.add_argument("--crf", type=float)
     p.add_argument("--preset")
     p.add_argument("--maxrate")
@@ -175,12 +176,18 @@ def run(args):
     overrides = {}
     if args.fonts_dir is not None:
         overrides["render"] = {"fonts_dir": str(args.fonts_dir.resolve())}
-    if args.allow_merged_box is not None or args.backend is not None:
+    if args.allow_merged_box is not None or args.backend is not None or args.grouping is not None:
         overrides["selection"] = {}
         if args.allow_merged_box is not None:
             overrides["selection"]["allow_merged_box"] = args.allow_merged_box
+            if args.allow_merged_box and args.grouping is None:
+                overrides["selection"]["grouping"] = "merged"
         if args.backend is not None:
             overrides["selection"]["backend"] = args.backend
+        if args.grouping is not None:
+            overrides["selection"]["grouping"] = args.grouping
+            if args.grouping == "per-event" and args.allow_merged_box is None:
+                overrides["selection"]["allow_merged_box"] = False
     cfg = resolve_config(args.config, cli_defaults=args.default, blur_sigma=args.blur_sigma,
                          burn_subtitles=args.burn_subtitles, marker_prefix=args.marker_prefix,
                          section_overrides=overrides)
@@ -236,6 +243,7 @@ def run(args):
                                   fonts_dir=fonts_dir, native_budget=budget, max_bytes=budget.limit,
                                   profile_id="ffmpeg-ass-mirrored-v1")
         backend = create_backend(cfg.selection["backend"])
+        log("字幕分析后端：" + backend.name + "；分组：" + cfg.selection["grouping"])
         prepared = backend.preflight(source, selection_plan, profile)
         builders = {selection_plan.default_config.mode: create_builder(selection_plan.default_config.mode)}
         builders.update({target.config.mode: create_builder(target.config.mode) for target in selection_plan.targets})
@@ -243,10 +251,13 @@ def run(args):
             builders[target.config.mode].validate_config(target.config)
         native_info = libass_info()
         manifest["runtime"] = verify_ass_runtime(caps, work, native_info["path"], int(native_info["version_hex"], 16), bool(fonts_dir))
+        manifest["runtime"]["event_export_abi"] = native_info.get("event_export_abi", 0)
         manifest["native"] = native_info
         manifest["prepared_selection"] = prepared.manifest()
         manifest["analysis_sha256"] = hashlib.sha256(prepared.analysis_data).hexdigest()
         manifest["selection"] = selection_plan.manifest()
+        manifest["selection"]["backend_requested"] = cfg.selection["backend"]
+        manifest["selection"]["backend"] = backend.name
         if args.check_only:
             manifest["status"] = "checked"
             manifest["timings"] = {"total_seconds": time.monotonic() - started}

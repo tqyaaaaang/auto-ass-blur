@@ -74,8 +74,32 @@ class ConfigurationTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(ConfigError):
                 resolve_config({"output": {"burn_subtitles": value}})
 
-    def test_auto_backend_resolves_to_registered_alpha(self):
-        self.assertEqual(resolve_config({"selection": {"backend": "auto"}}).selection["backend"], "alpha")
+    def test_auto_backend_is_resolved_only_after_runtime_detection(self):
+        self.assertEqual(resolve_config().selection["backend"], "auto")
+        self.assertEqual(resolve_config().selection["grouping"], "per-event")
+        self.assertEqual(resolve_config({"selection": {"allow_merged_box": True}}).selection["grouping"], "merged")
+        with self.assertRaises(ConfigError):
+            resolve_config({"selection": {"allow_merged_box": True, "grouping": "per-event"}})
+
+    def test_group_is_selection_metadata_in_actor_and_sidecar(self):
+        marker = parse_marker("bgblur{group=为啥;strength=0.75}")
+        self.assertEqual(marker.values["group"], "为啥")
+        effect = resolve_event_config(resolve_config(), marker)
+        self.assertEqual(effect.strength, .75)
+        self.assertNotIn("group", effect.sources)
+        self.assertFalse(hasattr(effect, "group"))
+        source = document("text")
+        sidecar = create_sidecar(source, [0])
+        sidecar["events"][0]["overrides"] = {"group": "why"}
+        self.assertEqual(load_sidecar(sidecar, source)[0].values, {"group": "why"})
+        with self.assertRaisesRegex(ConfigError, "conflict"):
+            merge_overrides(marker, load_sidecar(sidecar, source)[0])
+        for value in ("", "a b", "x,y", "a;b", "a=b", "a" * 129, True, 1, None):
+            with self.subTest(value=value), self.assertRaises(ConfigError):
+                sidecar["events"][0]["overrides"] = {"group": value}
+                load_sidecar(sidecar, source)
+        with self.assertRaises(ConfigError):
+            resolve_config({"defaults": {"group": "everyone"}})
 
     def test_defaults_validation_and_duplicate_aliases(self):
         configs = ({"defaults": {"feather": 1, "feather_sigma": 1}}, {"defaults": {"strength": None}},

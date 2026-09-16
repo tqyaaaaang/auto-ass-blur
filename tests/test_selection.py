@@ -13,21 +13,28 @@ from test_ass import HEADER, document
 PROFILE = SimpleNamespace(frame_size=(640, 360), fonts_dir=None, profile_id="test-fixture")
 
 
+def alpha_config(project=None):
+    """Keep the original Alpha compatibility suite explicit about legacy grouping."""
+    values = dict(project or {})
+    values['selection'] = dict({'backend': 'alpha', 'grouping': 'merged'}, **values.get('selection', {}))
+    return resolve_config(values)
+
+
 class SelectionPlanningTests(unittest.TestCase):
     def preflight(self, source, **kwargs):
-        cfg = resolve_config(kwargs)
+        cfg = alpha_config(kwargs)
         plan = build_selection_plan(source, cfg)
         return AlphaTrackBackend().preflight(source, plan, PROFILE)
 
     def test_actor_not_effect_selection_and_sidecar(self):
         source = document("ordinary", effect="bgblur", second="target")
-        plan = build_selection_plan(source, resolve_config())
+        plan = build_selection_plan(source, alpha_config())
         self.assertEqual(plan.target_indices, (1,))
         # A real unselected Effect needs EventImages; Actor does not consume it.
         with self.assertRaises(ValueError):
             AlphaTrackBackend().preflight(source, plan, PROFILE)
         sidecar = create_sidecar(source, [0])
-        plan = build_selection_plan(source, resolve_config(), sidecar)
+        plan = build_selection_plan(source, alpha_config(), sidecar)
         self.assertEqual(plan.target_indices, (0, 1))
 
     def test_same_config_box_requires_explicit_merge(self):
@@ -62,8 +69,7 @@ class SelectionPlanningTests(unittest.TestCase):
         self.preflight(source, selection={"allow_merged_box": True})
 
     def test_unsupported_backends_grouping_and_profile_binding(self):
-        with self.assertRaisesRegex(SelectionError, "not implemented"):
-            create_backend("event-images")
+        self.assertEqual(create_backend("event-images").name, "event-images")
         with self.assertRaises(SelectionError):
             create_backend("missing")
         source = document("one", actor="bgblur")
@@ -84,7 +90,7 @@ class SelectionPlanningTests(unittest.TestCase):
         register_backend("test-synthetic", SyntheticBackend)
         backend = create_backend("test-synthetic")
         source = document("one", actor="bgblur")
-        plan = build_selection_plan(source, resolve_config())
+        plan = build_selection_plan(source, alpha_config())
         self.assertEqual(backend.preflight(source, plan, PROFILE)[1], (0,))
 
     def test_event_group_backend_swaps_without_box_or_encoder_changes(self):
@@ -141,7 +147,7 @@ class SelectionNativeTests(unittest.TestCase):
             "Dialogue: 0,0:00:00.02,0:00:00.05,Default,bgblur,0,0,0,,Target\n"
             "Dialogue: 0,0:00:00.00,0:00:00.10,Default,,0,0,0,,ordinary\n").encode())
         profile = SimpleNamespace(frame_size=(640, 360), fonts_dir=None, native_budget=NativeBudget(4 * 1024 * 1024))
-        cfg = resolve_config()
+        cfg = alpha_config()
         backend = AlphaTrackBackend()
         prepared = backend.preflight(source, build_selection_plan(source, cfg), profile)
         session = backend.open(prepared)

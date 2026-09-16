@@ -1,4 +1,4 @@
-"""Owned, coarse-grained native operations backed by stock libass.
+"""Owned native operations with optional libass EventImages ABI detection.
 
 ctypes crosses the ABI once per render/build/encode operation. Linked-list walks,
 bitmap copies, Gaussian filtering and chroma sampling stay entirely in C++.
@@ -33,7 +33,12 @@ def library():
         if (root / 'assglass.cpp').is_file() and (root / 'build.py').is_file():
             suffix = '.dylib' if sys.platform == 'darwin' else '.so'
             path = root / ('libassglass' + suffix)
-            if not path.exists() or path.stat().st_mtime < (root / 'assglass.cpp').stat().st_mtime:
+            inputs = [root / 'assglass.cpp', root / 'build.py']
+            private_pc = package.parent / '.tools/libass-event-images/lib/pkgconfig/libass.pc'
+            if private_pc.exists():
+                inputs.append(private_pc)
+            newest_input = max(item.stat().st_mtime for item in inputs)
+            if not path.exists() or path.stat().st_mtime < newest_input:
                 spec = importlib.util.spec_from_file_location('_assglass_build', str(root / 'build.py'))
                 module = importlib.util.module_from_spec(spec)
                 spec.loader.exec_module(module)
@@ -42,7 +47,7 @@ def library():
                     cache = Path(tempfile.gettempdir()) / ('assglass-native-' + str(os.getuid()))
                     cache.mkdir(mode=0o700, parents=True, exist_ok=True)
                     path = cache / ('libassglass-' + digest + suffix)
-                if not path.exists() or path.stat().st_mtime < (root / 'assglass.cpp').stat().st_mtime:
+                if not path.exists() or path.stat().st_mtime < newest_input:
                     fd, temporary = tempfile.mkstemp(prefix='assglass-build-', suffix=suffix, dir=str(path.parent))
                     os.close(fd)
                     try:
@@ -64,11 +69,20 @@ def library():
             'ag_budget_new': (P, [S]), 'ag_budget_free': (None, [P]),
             'ag_budget_used': (S, [P]), 'ag_budget_peak': (S, [P]),
             'ag_libass_version': (I, []), 'ag_libass_path': (C.c_char_p, []),
+            'ag_event_export_abi': (C.c_uint, []),
             'ag_time_ms': (Q, [Q, Q, Q]),
             'ag_session_new': (P, [C.c_char_p, S, I, I, C.c_char_p, P]),
             'ag_session_free': (None, [P]), 'ag_session_logs': (C.c_char_p, [P]),
             'ag_session_render': (P, [P, Q]),
+            'ag_session_event_count': (I, [P]),
+            'ag_session_event_metadata': (I, [P, I, C.POINTER(Q), intp, C.POINTER(C.c_char_p)]),
+            'ag_session_enable_events': (I, [P, intp, S]),
+            'ag_session_render_events': (P, [P, Q]),
+            'ag_event_frame_free': (None, [P]),
+            'ag_event_frame_changed': (I, [P]),
+            'ag_event_frame_take': (P, [P, I, P]),
             'ag_images_new': (P, [P]),
+            'ag_images_combine': (P, [C.POINTER(P), S, P]),
             'ag_images_append': (I, [P, I, I, I, I, I, U, I, bytep, S]),
             'ag_images_count': (S, [P]), 'ag_images_changed': (I, [P]),
             'ag_images_digest': (C.c_uint64, [P]),
@@ -107,7 +121,12 @@ def libass_info():
     lib = library()
     version = lib.ag_libass_version()
     return {'version_hex': hex(version), 'version': '%x.%x.%x' % ((version >> 28) & 15, (version >> 20) & 255, (version >> 12) & 255),
-            'path': lib.ag_libass_path().decode('utf-8', 'replace')}
+            'path': lib.ag_libass_path().decode('utf-8', 'replace'),
+            'event_export_abi': lib.ag_event_export_abi()}
+
+
+def event_export_available():
+    return library().ag_event_export_abi() == 1
 
 
 def ffmpeg_time_ms(pts, time_base, denominator=None):
@@ -213,6 +232,14 @@ class NativeImages(_Owner):
         budget = budget or NativeBudget()
         return cls(library().ag_images_new(budget._handle), budget)
 
+    @classmethod
+    def combine(cls, images, budget=None):
+        """Copy source planes into one owned group, keeping type/color/coverage."""
+        images = tuple(images)
+        budget = budget or (images[0].budget if images else NativeBudget())
+        handles = (C.c_void_p * len(images))(*(image.handle for image in images))
+        return cls(library().ag_images_combine(handles, len(images), budget._handle), budget)
+
     def append(self, x, y, w, h, coverage, color=0xFFFFFF00, image_type='character', stride=None):
         """Test/debug import; production uses one C++ copy of the libass chain."""
         payload = bytes(coverage)
@@ -271,6 +298,22 @@ class NativeSession:
             return NativeImages(self._lib.ag_session_render(self._handle, time_ms), self.budget)
 
     @property
+    def event_metadata(self):
+        """Frozen libass event order for validating the Python Dialogue mapping."""
+        with self._lock:
+            if not self._handle:
+                raise RuntimeError('render session is closed')
+            result = []
+            for index in range(self._lib.ag_session_event_count(self._handle)):
+                timing, fields, strings = (C.c_int64 * 2)(), (C.c_int * 4)(), (C.c_char_p * 4)()
+                _status(self._lib.ag_session_event_metadata(self._handle, index, timing, fields, strings))
+                text = [(value or b'').decode('utf-8', 'replace') for value in strings]
+                result.append(dict(start_ms=timing[0], duration_ms=timing[1], layer=fields[0],
+                                   margin_l=fields[1], margin_r=fields[2], margin_v=fields[3],
+                                   style=text[0], name=text[1], text=text[2], effect=text[3]))
+            return tuple(result)
+
+    @property
     def logs(self):
         with self._lock:
             return self._lib.ag_session_logs(self._handle).decode('utf-8', 'replace') if self._handle else self._logs
@@ -291,6 +334,61 @@ class NativeSession:
 
     def __exit__(self, *_):
         self.close()
+
+
+class NativeEventFrame:
+    """Owns callback copies until transferred; no libass pointers escape render."""
+    def __init__(self, handle, budget):
+        self._lib = library()
+        self._handle = _check(handle)
+        self.budget = budget
+        self.changed = self._lib.ag_event_frame_changed(self._handle)
+        self._taken = set()
+
+    def take(self, index):
+        if not self._handle:
+            raise RuntimeError('EventImages frame is released')
+        if type(index) is not int or not 0 <= index < 2**31:
+            raise ValueError('event index must be a nonnegative 32-bit integer')
+        if index in self._taken:
+            raise RuntimeError('event image ownership was already transferred')
+        result = NativeImages(self._lib.ag_event_frame_take(self._handle, index, self.budget._handle), self.budget)
+        self._taken.add(index)
+        return result
+
+    def release(self):
+        if getattr(self, '_handle', None):
+            self._lib.ag_event_frame_free(self._handle)
+            self._handle = None
+
+    def __del__(self):
+        self.release()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.release()
+
+
+class NativeEventSession(NativeSession):
+    def __init__(self, ass_data, width, height, fonts_dir=None, budget=None, selected_indices=()):
+        super().__init__(ass_data, width, height, fonts_dir, budget)
+        try:
+            selected_indices = tuple(selected_indices)
+            if any(type(index) is not int or not 0 <= index < 2**31 for index in selected_indices):
+                raise ValueError('selected event indices must be nonnegative 32-bit integers')
+            indices = (C.c_int * len(selected_indices))(*selected_indices)
+            _status(self._lib.ag_session_enable_events(self._handle, indices, len(indices)))
+        except BaseException:
+            self.close()
+            raise
+
+    def render(self, time_ms):
+        with self._lock:
+            if not self._handle:
+                raise RuntimeError('render session is closed')
+            return NativeEventFrame(self._lib.ag_session_render_events(self._handle, time_ms), self.budget)
 
 
 class NativeMask(_Owner):

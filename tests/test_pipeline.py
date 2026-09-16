@@ -126,6 +126,39 @@ def read_masks(path):
     return active, digest.hexdigest()
 
 
+def test_real_pipeline_independent_groups_keep_gap_clear(source_video, tmp_path, native_core):
+    """Exercise original-track event selection through raw weights and FFmpeg."""
+    ass = tmp_path / "groups.ass"
+    ass.write_text(HEADER +
+        r"Dialogue: 0,0:00:00.00,0:00:00.20,Default,bgblur{group=left},0,0,0,,{\an7\pos(100,600)\bord0\shad0\p1}m 0 0 l 100 0 100 50 0 50" + "\n" +
+        r"Dialogue: 1,0:00:00.00,0:00:00.20,Default,bgblur{group=right;strength=0.5},0,0,0,,{\an7\pos(1500,300)\bord0\shad0\p1}m 0 0 l 100 0 100 50 0 50" + "\n" +
+        r"Dialogue: 0,0:00:00.00,0:00:00.20,Default,narrator,0,0,0,fx,{\an7\pos(100,80)\k10}UNMARKED KARAOKE" + "\n",
+        encoding="utf-8")
+    output, debug = tmp_path / "groups.mp4", tmp_path / "groups.raw"
+    legacy_config = tmp_path / "legacy.json"
+    legacy_config.write_text(json.dumps({"selection": {"allow_merged_box": True}}))
+    result = execute(source_video, ass, output, "--no-burn-subtitles", "--debug-mask", debug,
+                     "--config", legacy_config, "--grouping", "per-event",
+                     "--default", "padding_x=0", "--default", "padding_y=0",
+                     "--default", "radius=0", "--default", "feather=0")
+    require_success(result)
+    with debug.open("rb") as stream:
+        for _ in range(FRAMES):
+            frame = stream.read(FRAME_BYTES)
+            assert len(frame) == FRAME_BYTES
+            assert frame[625 * WIDTH + 140] == 255
+            assert frame[325 * WIDTH + 1540] == 128
+            assert frame[450 * WIDTH + 800] == 0  # inside the old shared rectangle
+            assert not any(frame[:WIDTH * 200])  # no unmarked karaoke contribution
+        assert stream.read(1) == b""
+    manifest = json.loads(Path(str(output) + ".manifest.json").read_text())
+    assert manifest["selection"]["backend"] == "event-images"
+    assert manifest["selection"]["grouping"] == "per-event"
+    assert manifest["prepared_selection"]["analysis_rewrite"] == "none"
+    assert manifest["runtime"]["event_export_abi"] == 1
+    assert_timeline(output)
+
+
 def probe(path):
     result = run([
         shutil.which(FFPROBE), "-v", "error", "-select_streams", "v:0",
