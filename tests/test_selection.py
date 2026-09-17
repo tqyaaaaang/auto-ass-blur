@@ -30,9 +30,11 @@ class SelectionPlanningTests(unittest.TestCase):
         source = document("ordinary", effect="bgblur", second="target")
         plan = build_selection_plan(source, alpha_config())
         self.assertEqual(plan.target_indices, (1,))
-        # A real unselected Effect needs EventImages; Actor does not consume it.
-        with self.assertRaises(ValueError):
-            AlphaTrackBackend().preflight(source, plan, PROFILE)
+        # An inert Effect neither selects an event nor blocks Alpha analysis.
+        prepared = AlphaTrackBackend().preflight(source, plan, PROFILE)
+        rewritten = SourceDocument.from_bytes(prepared.analysis_data)
+        self.assertEqual(rewritten.events[0].effect, "bgblur")
+        self.assertEqual(rewritten.events[0].text, r"{\alpha&HFF&}ordinary")
         sidecar = create_sidecar(source, [0])
         plan = build_selection_plan(source, alpha_config(), sidecar)
         self.assertEqual(plan.target_indices, (0, 1))
@@ -176,7 +178,9 @@ class SelectionNativeTests(unittest.TestCase):
         samples = ("word", r"{\alpha&H80}word", r"word{\rAlt}word",
                    r"{\alpha&H80}word{\rAlt\alpha&H80}word",
                    r"{\t(\alpha&H80)}word", r"{\t(2,\1a&H80\2a&HFF)}word",
-                   r"{\rAlt\t(0,1000,\alpha&H80)}word", r"{\t(0,3000,0.5,\alpha&H80)}word")
+                   r"{\rAlt\t(0,1000,\alpha&H80)}word", r"{\t(0,3000,0.5,\alpha&H80)}word",
+                   r"{\alpha&H80&\c&HFF6408&}first{\c\1c\2c\3c\4c}second",
+                   r"{\rAlt\c\1c\2c\3c\4c}word")
         for text in samples:
             with self.subTest(text=text):
                 plan = build_analysis(document(text), [])
@@ -208,9 +212,13 @@ class SelectionNativeTests(unittest.TestCase):
         def snapshot(images, filter_colors=False):
             return tuple((image.type, image.dst_x, image.dst_y, image.w, image.h, image.color, bytes(image.coverage))
                          for image in images if not filter_colors or image.color >> 8 in colors)
-        for sample in samples:
-            with self.subTest(sample=sample):
-                source = document(sample, second=target)
+        cases = [(sample, "") for sample in samples] + [
+            ("Long ordinary text " * 5, "fx"),
+            (r"{\c&HFF6408&}first{\c\3c}second", "fx"),
+            (r"{\rAlt\c\1c\2c\3c\4c}context", " \tcustom note\t ")]
+        for sample, effect in cases:
+            with self.subTest(sample=sample, effect=effect):
+                source = document(sample, effect=effect, second=target)
                 # A third, unmarked event enters midway, advancing collision history.
                 source = SourceDocument.from_bytes(source.raw + b"Dialogue: 0,0:00:00.50,0:00:01.00,Default,,0,0,0,,late context\n")
                 plan = build_analysis(source, [1])

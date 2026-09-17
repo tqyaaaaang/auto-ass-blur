@@ -1,4 +1,4 @@
-"""Strict, byte-preserving ASS parsing and the versioned alpha-v1 rewrite.
+"""Strict, byte-preserving ASS parsing and the versioned alpha rewrite.
 
 Event identities are zero-based Dialogue indices in the original byte stream.
 Comment lines never acquire an event identity. Parsing never normalizes Unicode,
@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 PARSER_VERSION = "assglass-ass-v1"
-ALPHA_RULES_VERSION = "alpha-v1"
+ALPHA_RULES_VERSION = "alpha-v1.1"
 HIDDEN = r"{\alpha&HFF&}"
 _ALPHA_NAMES = {"alpha", "1a", "2a", "3a", "4a"}
 _TIME = re.compile(r"(\d+):([0-5]\d):([0-5]\d)\.(\d{2})\Z")
@@ -348,7 +348,9 @@ def _validate_token(token: Token, event: Event, geometry_counts: Dict[str, int])
         if not value or not value.strip():
             _fail(event, "SYNTAX", "font name must be nonempty")
     elif name in {"c", "1c", "2c", "3c", "4c"}:
-        if not re.fullmatch(r"&H[0-9A-Fa-f]{1,6}&?", value):
+        # An omitted RGB value restores the corresponding current Style colour
+        # in libass. It preserves alpha, so retain the reset token unchanged.
+        if value and not re.fullmatch(r"&H[0-9A-Fa-f]{1,6}&?", value):
             _fail(event, "SYNTAX", "invalid RGB override {!r}".format(value))
     elif name in {"pos", "org", "clip", "iclip"}:
         if not value.startswith("(") or not value.endswith(")"):
@@ -431,8 +433,11 @@ class RewriteRecord:
 def rewrite_event(document: SourceDocument, event: Event) -> RewriteRecord:
     """Classify original alpha states before performing any byte-local rewrite."""
     state = _style(document, event.style, event)
-    if event.effect.strip():
-        _fail(event, "COMBINATION", "unselected event has a nonempty Effect field")
+    # libass trims ASCII spaces/tabs from fields and recognises only these
+    # case-sensitive transition prefixes. Unknown effects (including Aegisub's
+    # "fx" marker) are inert; preserve them instead of rejecting all metadata.
+    if event.effect.strip(" \t").startswith(("Banner;", "Scroll up;", "Scroll down;")):
+        _fail(event, "COMBINATION", "unselected event uses a scrolling Effect unsupported by alpha analysis: {!r}".format(event.effect))
     items = parse_override_text(event.text, event)
     geometry_counts = {}
     for item in items:

@@ -142,8 +142,35 @@ class AlphaRulesTests(unittest.TestCase):
                 result = self.rule("{" + text + "}word", "AV1-PREFIX")
                 self.assertEqual(result.text, r"{\alpha&HFF&}{" + text + "}word")
 
+    def test_bare_rgb_resets_preserve_original_tokens_and_alpha(self):
+        for tags in (r"\c", r"\1c", r"\2c", r"\3c", r"\4c", r"\c\3c"):
+            with self.subTest(tags=tags):
+                text = r"{\alpha&H80&\c&HFF6408&}before{" + tags + "}after"
+                result = self.rule(text, "AV1-STATIC")
+                self.assertEqual(result.text, r"{\alpha&HFF&}" + text.replace(r"\alpha&H80&", r"\alpha&HFF&"))
+        result = self.rule(r"{\rAlt\c\1c\2c\3c\4c}word", "AV1-RESET")
+        self.assertIn(r"\rAlt\alpha&HFF&\c\1c\2c\3c\4c", result.text)
+
+    def test_inert_effects_are_preserved_but_scrolling_effects_are_rejected(self):
+        for effect in ("fx", "karaoke", "bgblur", "custom note", " \tfx\t ",
+                       "Banner", "banner;10;0", "Scroll Up;0;360;10"):
+            with self.subTest(effect=effect):
+                source = document("ordinary", effect=effect, second="target")
+                plan = build_analysis(source, [1])
+                analysis = SourceDocument.from_bytes(plan.analysis_data)
+                self.assertEqual(analysis.events[0].effect, effect)
+                self.assertEqual(analysis.events[0].text, r"{\alpha&HFF&}ordinary")
+                self.assertEqual(analysis.events[1].text, source.events[1].text)
+                self.assertEqual(plan.manifest()["alpha_rules_version"], "alpha-v1.1")
+        for effect in ("Banner;10;0", "Scroll up;0;360;10", "Scroll down;0;360;10",
+                       " \tBanner;10;0\t "):
+            with self.subTest(effect=effect):
+                self.reject("ordinary", "COMBINATION", effect=effect)
+        # Accepting inert metadata must not bypass the independent Text checks.
+        self.reject(r"{\k20}word", "COMBINATION", effect="fx")
+
     def test_syntax_and_unsupported(self):
-        for tag in (r"\alpha&H000", r"\alpha&HGG", r"\1a", r"\alpha&H1&oops", r"\c&H12345678",
+        for tag in (r"\alpha&H000", r"\alpha&HGG", r"\1a", r"\alpha&H1&oops", r"\c&H12345678", r"\c&H", r"\3c&HGG&",
                     r"\fsNaN", r"\fn", r"\an10", r"\q4", r"\be-1", r"\pos(1)", r"\b1.5"):
             with self.subTest(tag=tag):
                 self.reject("{" + tag + "}word", "SYNTAX")
