@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import sys
+import zlib
 
 import pytest
 
@@ -195,8 +196,9 @@ def cropped_first_frame(ffmpeg, path):
     return result.stdout
 
 
+@pytest.mark.parametrize("mode", ["box", "organic"])
 def test_real_pipeline_burn_switch_keeps_masks_and_frame_alignment(
-    tmp_path, source_video, ffmpeg, native_core,
+    tmp_path, source_video, ffmpeg, native_core, mode,
 ):
     # Spaces and punctuation force paths to go through the real path/graph adapter.
     ass = write_ass(tmp_path / "subtitle 空格.ass")
@@ -208,6 +210,8 @@ def test_real_pipeline_burn_switch_keeps_masks_and_frame_alignment(
         result = execute(
             source_video, ass, output, "--debug-mask", mask, "--manifest", manifest,
             "--burn-subtitles" if burn else "--no-burn-subtitles",
+            "--default", "mode=" + mode,
+            "--mask-hash", "sha256" if not burn else "crc32",
         )
         require_success(result)
         active, digest = read_masks(mask)
@@ -216,16 +220,45 @@ def test_real_pipeline_burn_switch_keeps_masks_and_frame_alignment(
         assert manifest.is_file()
         report = json.loads(manifest.read_text())
         assert report["status"] == "complete"
-        assert report["mask_sha256"] == digest
+        if not burn:
+            assert report["mask_sha256"] == digest
+            assert report["mask_checksum"]["algorithm"] == "sha256"
+            assert report["mask_checksum"]["value"] == digest
+        else:
+            crc = 0
+            with mask.open('rb') as stream:
+                for _ in range(FRAMES):
+                    crc = zlib.crc32(stream.read(FRAME_BYTES), crc)
+            assert report["mask_checksum"] == dict(algorithm="crc32", value="%08x" % crc,
+                                                   frames=FRAMES, bytes=FRAMES * FRAME_BYTES)
+            assert "mask_sha256" not in report
+            assert report["optimization"]["checksum"]["reused_frames"] == 8
+        assert report["optimization"]["weight_cache"]["hits"] == 8
+        assert report["timings"]["stages_seconds"]["checksum"] >= 0
         assert report["ledger"]["frames"] == FRAMES
         assert report["transport"]["sent_frames"] == FRAMES
         assert report["transport"]["observed_frames"] == FRAMES
         assert report["transport"]["sent_bytes"] == FRAMES * FRAME_BYTES
-        assert report["filtergraph"].count("gblur=") == 1
-        assert report["filtergraph"].count("maskedmerge=") == 1
+        assert report["filtergraph"].count("gblur@assglass_blur=") == 1
+        assert report["filtergraph"].count("maskedmerge@assglass_merge=") == 1
+        assert report["activity"]["active_frames"] == 6
+        assert report["activity"]["inactive_frames"] == 6
+        assert report["optimization"]["skipped_mask_frames"] == 6
+        assert report["optimization"]["mask_cache"]["hits"] == 4
+        assert report["optimization"]["mask_cache"]["builds"] == 2
         assert report["filtergraph"].count(",ass=filename=original.ass") == int(burn)
         assert report["ffmpeg_argv"].count("-c:v") == 1
         assert report["output"]["burn_subtitles"] is burn
+        geometry = report["mask_geometry"]["targets"][0]
+        assert geometry["dtype"] == "float32"
+        assert geometry["feather_kernel_size"] == (97 if mode == "organic" else 73)
+        if mode == "organic":
+            assert geometry["dilation_kernel_size"] == [97, 73]
+            assert geometry["closing_kernel_size"] == [97, 97]
+            assert geometry["dilation_kernel_shape"] == "ellipse"
+            assert geometry["closing_kernel_shape"] == "rectangle"
+            assert geometry["halo"] == [192, 180]
+            assert geometry["algorithm_version"] == "organic-ellipse-expand-rect-close-v2"
         assert report["memory"]["native_peak_bytes"] <= report["memory"]["max_in_flight_bytes"]
         outcomes[burn] = (output, digest, report)
     assert ass.read_bytes() == original
@@ -248,6 +281,11 @@ def test_no_markers_sends_zero_all_planes_but_still_burns_original(
     require_success(result)
     active, _ = read_masks(mask)
     assert active == []
+    report = json.loads(Path(str(output) + ".manifest.json").read_text())
+    assert report["activity"]["active_frames"] == 0
+    assert report["optimization"]["mask_cache"]["builds"] == 0
+    assert report["optimization"]["skipped_mask_frames"] == FRAMES
+    assert report["optimization"]["empty_weight_allocations"] == 1
     assert_timeline(output)
     original = cropped_first_frame(ffmpeg, source_video)
     burned = cropped_first_frame(ffmpeg, output)
@@ -267,6 +305,34 @@ def test_invalid_per_line_sigma_fails_without_publishing_output(
     assert result.returncode != 0
     assert not output.exists()
     assert b"blur_sigma" in result.stderr
+
+
+def test_organic_cache_switch_preserves_whole_weight_stream(source_video, tmp_path, native_core):
+    ass = write_ass(tmp_path / "cache.ass")
+    reports = []
+    byte_digests = []
+    for limit in (0, 16 * 1024 * 1024):
+        config = tmp_path / (str(limit) + ".json")
+        config.write_text(json.dumps({"transport": {"mask_cache_bytes": limit, "weight_cache_bytes": limit}}))
+        output = tmp_path / (str(limit) + ".mp4")
+        raw = tmp_path / (str(limit) + ".raw")
+        require_success(execute(source_video, ass, output, "--config", config,
+                                "--debug-mask", raw,
+                                "--no-burn-subtitles", "--default", "mode=organic"))
+        reports.append(json.loads(Path(str(output) + ".manifest.json").read_text()))
+        byte_digests.append(read_masks(raw)[1])
+        assert_timeline(output)
+    # Independently hash actual raw bytes with SHA256, not just the new CRC.
+    assert byte_digests[0] == byte_digests[1]
+    assert reports[0]["mask_checksum"] == reports[1]["mask_checksum"]
+    assert reports[0]["optimization"]["weight_cache"]["hits"] == 0
+    assert reports[1]["optimization"]["weight_cache"]["hits"] == 8
+    assert reports[0]["optimization"]["checksum"]["reused_frames"] == 0
+    assert reports[1]["optimization"]["checksum"]["reused_frames"] == 8
+    assert reports[0]["optimization"]["mask_cache"]["hits"] == 0
+    assert reports[0]["optimization"]["mask_cache"]["builds"] == 6
+    assert reports[1]["optimization"]["mask_cache"]["hits"] == 4
+    assert reports[1]["optimization"]["mask_cache"]["builds"] == 2
 
 
 def test_existing_output_is_not_silently_replaced(tmp_path, source_video, native_core):

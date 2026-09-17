@@ -8,6 +8,10 @@ from fractions import Fraction
 from typing import Any, Mapping, Optional, Tuple
 
 
+MASK_ALGORITHMS = {'box': 'roundrect-ss4-opacity-threshold-v2',
+                   'organic': 'organic-ellipse-expand-rect-close-v2'}
+
+
 @dataclass(frozen=True)
 class ResolvedMaskConfig:
     mode: str = 'box'
@@ -21,12 +25,12 @@ class ResolvedMaskConfig:
     alpha_policy: str = 'geometry-only'
     bbox_policy: str = 'ink'
     clip_policy: str = 'expand-after-clip'
-    expand_x: int = 28
-    expand_y: int = 16
-    close: int = 14
+    expand_x: int = 48
+    expand_y: int = 36
+    close: int = 48
     sources: Mapping[str, str] = field(default_factory=dict, compare=False, hash=False)
     schema_version: str = 'mask-v1'
-    algorithm_version: str = 'roundrect-ss4-opacity-threshold-v2'
+    algorithm_version: str = MASK_ALGORITHMS['box']
 
 
 @dataclass(frozen=True)

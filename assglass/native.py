@@ -86,18 +86,22 @@ def library():
             'ag_images_append': (I, [P, I, I, I, I, I, U, I, bytep, S]),
             'ag_images_count': (S, [P]), 'ag_images_changed': (I, [P]),
             'ag_images_digest': (C.c_uint64, [P]),
+            'ag_images_equal': (I, [P, P]),
             'ag_images_get': (I, [P, S, intp, C.POINTER(U), C.POINTER(bytep)]),
             'ag_images_stats': (I, [P, I, D, intp, C.POINTER(U)]),
             'ag_mask_new': (P, [I, I, I, I, floatp, P]),
             'ag_box': (P, [P, I, I, I, I, I, I, F, F, D, I, P]),
+            'ag_organic': (P, [P, I, I, I, I, I, I, D, F, D, P]),
             'ag_mask_union': (P, [C.POINTER(P), S, I, I, P]),
             'ag_mask_get': (I, [P, intp, C.POINTER(floatp)]),
+            'ag_mask_equal': (I, [P, P]),
             'ag_weights': (P, [P, I, I, P]),
             'ag_weights_get': (S, [P, C.POINTER(bytep)]),
         }
         for kind in ('images', 'mask', 'weights'):
             signatures['ag_' + kind + '_retain'] = (P, [P])
             signatures['ag_' + kind + '_free'] = (None, [P])
+            signatures['ag_' + kind + '_bytes'] = (S, [P])
         for name, (result, args) in signatures.items():
             fn = getattr(lib, name)
             fn.restype, fn.argtypes = result, args
@@ -183,6 +187,11 @@ class _Owner:
     def retain(self):
         return type(self)(getattr(self._lib, 'ag_' + self.kind + '_retain')(self.handle), self.budget)
 
+    @property
+    def allocation_bytes(self):
+        """Bytes charged for this storage; retaining a handle does not copy it."""
+        return getattr(self._lib, 'ag_' + self.kind + '_bytes')(self.handle)
+
     def release(self):
         if getattr(self, '_handle', None):
             getattr(self._lib, 'ag_' + self.kind + '_free')(self._handle)
@@ -259,6 +268,12 @@ class NativeImages(_Owner):
     @property
     def digest(self):
         return '%016x' % self._lib.ag_images_digest(self.handle)
+
+    def equals(self, other):
+        """Exact descriptor/pixel equality, independent of libass's changed hint."""
+        if not isinstance(other, NativeImages):
+            return False
+        return bool(_status(self._lib.ag_images_equal(self.handle, other.handle)))
 
     def __len__(self):
         return self.image_count
@@ -394,6 +409,12 @@ class NativeEventSession(NativeSession):
 class NativeMask(_Owner):
     kind = 'mask'
 
+    def equals(self, other):
+        """Exact ROI/float32 bit equality; shared storage has a native fast path."""
+        if not isinstance(other, NativeMask):
+            return False
+        return bool(_status(self._lib.ag_mask_equal(self.handle, other.handle)))
+
     @classmethod
     def from_values(cls, roi=None, values=(), budget=None):
         budget = budget or NativeBudget()
@@ -451,6 +472,17 @@ def box_mask(images, cfg, frame_size, budget=None, allow_visual=False):
     handle = library().ag_box(images.handle, frame_size[0], frame_size[1], type_mask(cfg.include_types),
                              cfg.padding_x, cfg.padding_y, cfg.corner_radius, cfg.feather_sigma,
                              cfg.strength, cfg.opacity_threshold, int(visual), budget._handle)
+    return NativeMask(handle, budget)
+
+
+def organic_mask(images, cfg, frame_size, budget=None):
+    """Gray coverage union, ellipse expansion, rectangle closing and feather."""
+    budget = budget or images.budget
+    if cfg.alpha_policy != 'geometry-only':
+        raise ValueError('organic currently supports geometry-only alpha_policy')
+    handle = library().ag_organic(images.handle, frame_size[0], frame_size[1], type_mask(cfg.include_types),
+                                 cfg.expand_x, cfg.expand_y, cfg.close, cfg.feather_sigma,
+                                 cfg.strength, cfg.opacity_threshold, budget._handle)
     return NativeMask(handle, budget)
 
 

@@ -198,7 +198,6 @@ class AlphaRenderSession:
         time_ms = ffmpeg_time_ms(frame.pts, frame.time_base)
         if self._last_time is not None and time_ms < self._last_time:
             raise SelectionError("Render timestamps must be nondecreasing")
-        self._last_index, self._last_time = frame.frame_index, time_ms
         while self._cursor < len(self._starts) and self._starts[self._cursor].event.start_ms <= time_ms:
             target = self._starts[self._cursor]
             self._active[target.index] = target
@@ -215,8 +214,13 @@ class AlphaRenderSession:
         selection_digest = _digest((self.prepared.selection_digest, keys, mask_values(config)))
         image_digest = str(images.digest)
         group = ImageGroup("alpha-merged", None, keys, config, images)
-        return FrameSelection(frame, time_ms, (group,), images.changed, "alpha", 0, self.capabilities,
+        selected = FrameSelection(frame, time_ms, (group,), images.changed, "alpha", 0, self.capabilities,
             selection_digest, image_digest, _digest((selection_digest, image_digest)))
+        # An optional mask cache may need eviction after a native allocation
+        # failure. Commit the sequence only on success so the same frame can be
+        # retried; advancing the active-event cursor is idempotent at this time.
+        self._last_index, self._last_time = frame.frame_index, time_ms
+        return selected
 
     def close(self):
         if not self._closed:
@@ -333,7 +337,6 @@ class EventRenderSession:
         time_ms = ffmpeg_time_ms(frame.pts, frame.time_base)
         if self._last_time is not None and time_ms < self._last_time:
             raise SelectionError("Render timestamps must be nondecreasing")
-        self._last_index, self._last_time = frame.frame_index, time_ms
         while self._cursor < len(self._starts) and self._starts[self._cursor].event.start_ms <= time_ms:
             target = self._starts[self._cursor]
             self._active[target.index] = target
@@ -364,9 +367,11 @@ class EventRenderSession:
             identity = [(group.group_id, group.target_event_keys, mask_values(group.effect_config)) for group in groups]
             selection_digest = _digest((self.prepared.selection_digest, identity))
             image_digest = _digest([(group.group_id, str(group.images.digest)) for group in groups])
-            return FrameSelection(frame, time_ms, tuple(groups), exported.changed, "event-images", 0,
+            selected = FrameSelection(frame, time_ms, tuple(groups), exported.changed, "event-images", 0,
                                   self.capabilities, selection_digest, image_digest,
                                   _digest((selection_digest, image_digest)))
+            self._last_index, self._last_time = frame.frame_index, time_ms
+            return selected
         except BaseException:
             for group in groups:
                 group.images.release()

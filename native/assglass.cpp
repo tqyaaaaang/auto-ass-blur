@@ -188,6 +188,110 @@ float ss4(int i,int j,int x0,int y0,int x1,int y1,int requested_radius){
 }
 uint8_t quantize(float v){return uint8_t(std::floor(std::max(0.0f,std::min(1.0f,v))*255.0f+0.5f));}
 float sample(const Mask& m,int x,int y){if(x<m.x||y<m.y||x>=m.x+m.w||y>=m.y+m.h)return 0;return m.pixels[size_t(y-m.y)*m.w+(x-m.x)];}
+// The ellipse contains integer pixel centers satisfying
+// dx^2 * ry^2 + dy^2 * rx^2 <= rx^2 * ry^2. Zero axes become
+// horizontal/vertical lines; (0,0) is the identity. Integer arithmetic fixes
+// the kernel independently of OpenCV versions and floating-point rounding.
+void morphology_zero(const std::vector<float>& source,std::vector<float>& target,
+                     int w,int h,int rx,int ry,bool dilate,BudgetRef budget){
+    Charge work(budget);work.add((size_t(ry)+1+size_t(w))*sizeof(int));
+    std::vector<int> spans(size_t(ry)+1,rx),queue(w);
+    if(rx&&ry){
+        using Wide=__int128;
+        const Wide rx2=Wide(rx)*rx,ry2=Wide(ry)*ry,total=rx2*ry2;
+        int x=rx;
+        for(int y=0;y<=ry;y++){
+            while(Wide(x)*x*ry2+Wide(y)*y*rx2>total)--x;
+            spans[y]=x;
+        }
+    }
+    std::fill(target.begin(),target.end(),dilate?0.0f:1.0f);
+    // Unlike common morphology defaults, erosion also extends by zero.
+    // An out-of-canvas kernel row makes the entire output row zero.
+    if(!dilate){
+        int edge=std::min(h,ry);
+        std::fill(target.begin(),target.begin()+size_t(edge)*w,0.0f);
+        std::fill(target.begin()+size_t(std::max(0,h-ry))*w,target.end(),0.0f);
+    }
+    for(int dy=-ry;dy<=ry;dy++){
+        const int radius=spans[std::abs(dy)];
+        // Erosion's zero boundary rows are final already, so do not scan
+        // their source neighborhoods again for every ellipse row.
+        const int first=dilate?std::max(0,-dy):ry,last=dilate?std::min(h,h-dy):h-ry;
+        for(int y=first;y<last;y++){
+            const float* input=source.data()+size_t(y+dy)*w;
+            float* output=target.data()+size_t(y)*w;
+            int head=0,tail=0,next=0;
+            // Each input index enters/leaves the monotone deque at most
+            // once. Every ellipse row costs O(w), not O(w * radius).
+            for(int x=0;x<w;x++){
+                const int right=std::min(w-1,x+radius);
+                while(next<=right){
+                    while(head<tail&&(dilate?input[queue[tail-1]]<=input[next]:input[queue[tail-1]]>=input[next]))--tail;
+                    queue[tail++]=next++;
+                }
+                while(head<tail&&queue[head]<x-radius)++head;
+                const float value=(!dilate&&(x<radius||x+radius>=w))?0.0f:input[queue[head]];
+                output[x]=dilate?std::max(output[x],value):std::min(output[x],value);
+            }
+        }
+    }
+}
+// A rectangle separates into horizontal and vertical line passes. Each line
+// uses a monotone deque, so its work is linear in length, independent of radius.
+// Coverage stays grayscale and both operations extend the canvas by zero.
+void morphology_line_zero(const std::vector<float>& source,
+                          std::vector<float>& target,
+                          int w,int h,int radius,bool vertical,
+                          bool dilate,BudgetRef budget){
+    const int length=vertical?h:w,lines=vertical?w:h;
+    if(!length||!lines)return;
+    if(!dilate&&radius>=length){std::fill(target.begin(),target.end(),0.0f);return;}
+    Charge work(budget);work.add(size_t(length)*sizeof(int));
+    std::vector<int> queue(length);
+    const size_t stride=vertical?size_t(w):size_t(1);
+    for(int line=0;line<lines;line++){
+        const size_t base=vertical?size_t(line):size_t(line)*w;
+        int head=0,tail=0,next=0;
+        for(int position=0;position<length;position++){
+            const int right=std::min(length-1,position+radius);
+            while(next<=right){
+                const float incoming=source[base+size_t(next)*stride];
+                while(head<tail){
+                    const float prior=source[base+size_t(queue[tail-1])*stride];
+                    if(dilate?prior<=incoming:prior>=incoming)--tail;
+                    else break;
+                }
+                queue[tail++]=next++;
+            }
+            while(head<tail&&queue[head]<position-radius)++head;
+            target[base+size_t(position)*stride]=
+                (!dilate&&(position<radius||position+radius>=length))
+                ?0.0f:source[base+size_t(queue[head])*stride];
+        }
+    }
+}
+void organic_gaussian_zero(std::vector<float>& source,std::vector<float>& temp,
+                           int w,int h,double sigma,int radius,BudgetRef budget){
+    Charge work(budget);work.add(size_t(2*radius+1)*sizeof(float));
+    std::vector<float> kernel(2*radius+1);
+    // Dividing the coordinate first avoids sigma*sigma underflow for valid
+    // tiny positive sigmas: the center remains 1 and the tails become 0.
+    auto weight=[sigma](int offset){double distance=double(offset)/sigma;return std::exp(-0.5*distance*distance);};
+    double total=0;
+    for(int i=-radius;i<=radius;i++)total+=weight(i);
+    for(int i=-radius;i<=radius;i++)kernel[i+radius]=float(weight(i))/total;
+    for(int y=0;y<h;y++)for(int x=0;x<w;x++){
+        float value=0;
+        for(int k=-radius;k<=radius;k++)if(x+k>=0&&x+k<w)value+=source[size_t(y)*w+x+k]*kernel[k+radius];
+        temp[size_t(y)*w+x]=value;
+    }
+    for(int y=0;y<h;y++)for(int x=0;x<w;x++){
+        float value=0;
+        for(int k=-radius;k<=radius;k++)if(y+k>=0&&y+k<h)value+=temp[size_t(y+k)*w+x]*kernel[k+radius];
+        source[size_t(y)*w+x]=value;
+    }
+}
 #define BEGIN try { error.clear();
 #define END_NULL } catch(const std::exception& e){error=e.what();return nullptr;}
 #define END_INT } catch(const std::exception& e){error=e.what();return -1;}
@@ -273,6 +377,7 @@ void* ag_images_combine(void** images,size_t count,void* budget){BEGIN
 int ag_images_append(void* p,int x,int y,int w,int h,int stride,uint32_t color,int type,const uint8_t* data,size_t length){BEGIN copy_plane(*unwrap<Images>(p),x,y,w,h,stride,color,type,data,length);return 0;END_INT}
 void* ag_images_retain(void* p){BEGIN return new Ref<Images>(unwrap<Images>(p));END_NULL}
 void ag_images_free(void* p){delete static_cast<Ref<Images>*>(p);}
+size_t ag_images_bytes(void* p){return unwrap<Images>(p)->charge.size;}
 size_t ag_images_count(void* p){return unwrap<Images>(p)->planes.size();}
 int ag_images_changed(void* p){return unwrap<Images>(p)->changed;}
 int ag_images_get(void* p,size_t index,int* desc,uint32_t* color,const uint8_t** data){BEGIN
@@ -282,6 +387,15 @@ uint64_t ag_images_digest(void* p){
     auto add=[&](uint8_t b){hash=(hash^b)*1099511628211ULL;};
     for(const auto& im:unwrap<Images>(p)->planes){for(int64_t n:{int64_t(im.x),int64_t(im.y),int64_t(im.w),int64_t(im.h),int64_t(im.type),int64_t(im.color)})for(int s=0;s<8;s++)add(uint8_t(uint64_t(n)>>(8*s)));for(auto v:im.pixels)add(v);}return hash;
 }
+int ag_images_equal(void* a,void* b){BEGIN
+    const auto& left=*unwrap<Images>(a);const auto& right=*unwrap<Images>(b);
+    if(&left==&right)return 1;
+    if(left.planes.size()!=right.planes.size())return 0;
+    for(size_t i=0;i<left.planes.size();i++){
+        const auto& x=left.planes[i];const auto& y=right.planes[i];
+        if(x.x!=y.x||x.y!=y.y||x.w!=y.w||x.h!=y.h||x.type!=y.type||x.color!=y.color||x.pixels!=y.pixels)return 0;
+    }
+    return 1;END_INT}
 int ag_images_stats(void* p,int types,double opacity_threshold,int* bbox,uint32_t* peak){BEGIN auto s=stats(*unwrap<Images>(p),types,opacity_threshold);bbox[0]=s.x0;bbox[1]=s.y0;bbox[2]=s.x1;bbox[3]=s.y1;*peak=s.product;return s.nonempty?1:0;END_INT}
 void* ag_mask_new(int x,int y,int w,int h,const float* values,void* budget){BEGIN
     coordinate(x);coordinate(y);coordinate(int64_t(x)+w);coordinate(int64_t(y)+h);
@@ -310,6 +424,50 @@ void* ag_box(void* images,int fw,int fh,int types,int px,int py,int radius,float
     result->allocate(ox0,oy0,ox1-ox0,oy1-oy0);float gain=visual?float(s.product)/65025.0f:1.0f;
     for(int y=oy0;y<oy1;y++)for(int x=ox0;x<ox1;x++)result->pixels[size_t(y-oy0)*result->w+x-ox0]=std::max(0.0f,std::min(1.0f,(source[size_t(y-ry0)*ww+x-rx0]*gain)*strength));
     return new Ref<Mask>(std::move(result));END_NULL}
+void* ag_organic(void* images,int fw,int fh,int types,int rx,int ry,int close,double sigma,float strength,double opacity_threshold,void* budget){BEGIN
+    checked_area(fw,fh);
+    if(types<0||types>7||rx<0||ry<0||close<0||rx>1000000||ry>1000000||close>1000000||!std::isfinite(sigma)||sigma<0||sigma>100000||!std::isfinite(strength)||strength<0||strength>1)
+        throw std::runtime_error("invalid organic configuration");
+    auto b=get_budget(budget);auto result=std::make_shared<Mask>(b);
+    const auto& input=*unwrap<Images>(images);auto s=stats(input,types,opacity_threshold);
+    if(!s.nonempty||strength==0)return new Ref<Mask>(result);
+    const int feather=int(std::ceil(3.0*double(sigma)));
+    const int halo_x=rx+2*close+feather,halo_y=ry+2*close+feather;
+    const int x0=coordinate(int64_t(s.x0)-halo_x),y0=coordinate(int64_t(s.y0)-halo_y);
+    const int x1=coordinate(int64_t(s.x1)+halo_x),y1=coordinate(int64_t(s.y1)+halo_y);
+    const int ox0=std::max(0,x0),oy0=std::max(0,y0),ox1=std::min(fw,x1),oy1=std::min(fh,y1);
+    if(ox0>=ox1||oy0>=oy1)return new Ref<Mask>(result);
+    const int w=x1-x0,h=y1-y0;
+    const size_t bytes=checked_area(w,h,sizeof(float));Charge work(b);work.add(bytes);
+    std::vector<float> source(bytes/sizeof(float),0);
+    // The threshold qualifies each original plane pixel by effective opacity,
+    // but geometry-only preserves that pixel's coverage, without binarizing
+    // it or multiplying its surviving weight by opacity a second time.
+    for(const auto& im:input.planes){
+        if(im.type<0||im.type>2||!(types&(1<<im.type)))continue;
+        const uint32_t opacity=255-(im.color&255);
+        for(int y=0;y<im.h;y++)for(int x=0;x<im.w;x++){
+            const uint8_t coverage=im.pixels[size_t(y)*im.w+x];
+            if(double(uint32_t(coverage)*opacity)/65025.0<=opacity_threshold)continue;
+            auto& value=source[size_t(im.y+y-y0)*w+im.x+x-x0];
+            value=std::max(value,float(coverage)/255.0f);
+        }
+    }
+    if(rx||ry||close||feather){
+        Charge scratch(b);scratch.add(bytes);std::vector<float> temp(source.size(),0);
+        if(rx||ry){morphology_zero(source,temp,w,h,rx,ry,true,b);source.swap(temp);}
+        if(close){
+            morphology_line_zero(source,temp,w,h,close,false,true,b);source.swap(temp);
+            morphology_line_zero(source,temp,w,h,close,true,true,b);source.swap(temp);
+            morphology_line_zero(source,temp,w,h,close,false,false,b);source.swap(temp);
+            morphology_line_zero(source,temp,w,h,close,true,false,b);source.swap(temp);
+        }
+        if(feather)organic_gaussian_zero(source,temp,w,h,sigma,feather,b);
+    }
+    result->allocate(ox0,oy0,ox1-ox0,oy1-oy0);
+    for(int y=oy0;y<oy1;y++)for(int x=ox0;x<ox1;x++)
+        result->pixels[size_t(y-oy0)*result->w+x-ox0]=std::max(0.0f,std::min(1.0f,source[size_t(y-y0)*w+x-x0]*strength));
+    return new Ref<Mask>(std::move(result));END_NULL}
 void* ag_mask_union(void** masks,size_t count,int fw,int fh,void* budget){BEGIN
     checked_area(fw,fh);int x0=fw,y0=fh,x1=0,y1=0;
     for(size_t i=0;i<count;i++){auto& m=*unwrap<Mask>(masks[i]);if(!m.w||!m.h)continue;x0=std::min(x0,std::max(0,m.x));y0=std::min(y0,std::max(0,m.y));x1=std::max(x1,std::min(fw,m.x+m.w));y1=std::max(y1,std::min(fh,m.y+m.h));}
@@ -320,10 +478,21 @@ void* ag_mask_union(void** masks,size_t count,int fw,int fh,void* budget){BEGIN
     return new Ref<Mask>(std::move(result));END_NULL}
 void* ag_mask_retain(void* p){BEGIN return new Ref<Mask>(unwrap<Mask>(p));END_NULL}
 void ag_mask_free(void* p){delete static_cast<Ref<Mask>*>(p);}
+size_t ag_mask_bytes(void* p){return unwrap<Mask>(p)->charge.size;}
+int ag_mask_equal(void* a,void* b){BEGIN
+    const auto& lhs=unwrap<Mask>(a);const auto& rhs=unwrap<Mask>(b);
+    if(lhs.get()==rhs.get())return 1;
+    if(lhs->x!=rhs->x||lhs->y!=rhs->y||lhs->w!=rhs->w||lhs->h!=rhs->h)return 0;
+    return lhs->pixels.size()==rhs->pixels.size() && (lhs->pixels.empty() ||
+        std::memcmp(lhs->pixels.data(),rhs->pixels.data(),lhs->pixels.size()*sizeof(float))==0);
+    END_INT}
 int ag_mask_get(void* p,int* roi,const float** data){BEGIN auto& m=*unwrap<Mask>(p);roi[0]=m.x;roi[1]=m.y;roi[2]=m.x+m.w;roi[3]=m.y+m.h;*data=m.pixels.data();return 0;END_INT}
 void* ag_weights(void* mask,int fw,int fh,void* budget){BEGIN
     size_t ysize=checked_area(fw,fh);if(!fw||!fh||(fw%2)||(fh%2))throw std::runtime_error("yuv420p weights require positive even dimensions");
     auto& m=*unwrap<Mask>(mask);auto out=std::make_shared<Weights>(get_budget(budget));size_t uvsize=ysize/4;out->charge.add(ysize+2*uvsize);out->pixels.resize(ysize+2*uvsize);
+    // value-initialized storage is already the exact three-plane zero mask.
+    // Empty frames need no full-resolution or chroma sampling loops.
+    if(!m.w||!m.h)return new Ref<Weights>(std::move(out));
     for(int y=0;y<fh;y++)for(int x=0;x<fw;x++)out->pixels[size_t(y)*fw+x]=quantize(sample(m,x,y));
     // left phase: chroma centers (2u, 2v+.5); separable tent radius 2.
     const float wx[3]={.25f,.5f,.25f},wy[4]={.125f,.375f,.375f,.125f};
@@ -335,5 +504,6 @@ void* ag_weights(void* mask,int fw,int fh,void* budget){BEGIN
     return new Ref<Weights>(std::move(out));END_NULL}
 void* ag_weights_retain(void* p){BEGIN return new Ref<Weights>(unwrap<Weights>(p));END_NULL}
 void ag_weights_free(void* p){delete static_cast<Ref<Weights>*>(p);}
+size_t ag_weights_bytes(void* p){return unwrap<Weights>(p)->charge.size;}
 size_t ag_weights_get(void* p,const uint8_t** data){auto& w=*unwrap<Weights>(p);*data=w.pixels.data();return w.pixels.size();}
 }

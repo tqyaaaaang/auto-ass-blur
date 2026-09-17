@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 from .ass import PARSER_VERSION, SourceDocument
-from .contracts import ResolvedMaskConfig
+from .contracts import MASK_ALGORITHMS, ResolvedMaskConfig
 
 
 class ConfigError(ValueError):
@@ -23,6 +23,10 @@ ALIASES = {"feather": "feather_sigma", "radius": "corner_radius", "include": "in
 MASK_KEYS = {field.name for field in dataclasses.fields(ResolvedMaskConfig)} - {"sources", "schema_version", "algorithm_version"}
 INTEGER_KEYS = {"padding_x", "padding_y", "corner_radius", "expand_x", "expand_y", "close"}
 FLOAT_KEYS = {"feather_sigma", "strength", "blur_sigma", "opacity_threshold"}
+# Apply only after the row's final mode is known, so explicit project/CLI/row
+# values win and switching back to Box restores its own defaults.
+MODE_PRESETS = {"box": {}, "organic": {"expand_x": 48, "expand_y": 36, "close": 48,
+                                      "feather_sigma": 16.0}}
 _NUMBER = re.compile(r"-?(?:\d+(?:\.\d*)?|\.\d+)\Z")
 _SECTION_DEFAULTS = {
     "selection": {"backend": "auto", "alpha_unsafe": "error", "allow_merged_box": False, "grouping": "per-event"},
@@ -30,7 +34,8 @@ _SECTION_DEFAULTS = {
                "adapter_profile": "ffmpeg-ass-verified", "manifest_output": None},
     "video": {"profile": "auto", "unsupported": "error"},
     "transport": {"mode": "pipe", "max_in_flight_frames": 4, "max_in_flight_bytes": 67108864,
-                  "mask_cache_bytes": 0, "debug_mask_max_bytes": 1073741824},
+                  "mask_cache_bytes": 16777216, "weight_cache_bytes": 16777216,
+                  "mask_hash": "crc32", "debug_mask_max_bytes": 1073741824},
     "runtime": {"native_workers": 1, "ffmpeg_threads": "auto", "ffmpeg_filter_threads": "auto"},
     # The FFmpeg adapter resolves encoder aliases/defaults in one scope, so a
     # user `vb` cannot accidentally conflict with an already-filled `b:v`.
@@ -314,8 +319,13 @@ def resolve_config(project=None, cli_defaults: Sequence[str] = (), blur_sigma=No
     for key in ("max_in_flight_frames", "max_in_flight_bytes", "debug_mask_max_bytes"):
         if type(transport[key]) is not int or transport[key] <= 0:
             raise ConfigError("transport.{} must be a positive integer".format(key))
-    if transport["mask_cache_bytes"] != 0 or type(transport["mask_cache_bytes"]) is not int:
-        raise ConfigError("Cross-frame caching is not enabled; mask_cache_bytes must be 0")
+    for key in ("mask_cache_bytes", "weight_cache_bytes"):
+        if type(transport[key]) is not int or transport[key] < 0:
+            raise ConfigError("transport.{} must be a nonnegative integer (0 disables reuse)".format(key))
+        # Both optional caches share the existing total native allocation budget.
+        transport[key] = min(transport[key], transport["max_in_flight_bytes"])
+    if transport["mask_hash"] not in ("crc32", "sha256"):
+        raise ConfigError("transport.mask_hash must be crc32 or sha256")
     runtime = sections["runtime"]
     if runtime["native_workers"] != 1 or type(runtime["native_workers"]) is not int:
         raise ConfigError("The sequential renderer requires native_workers=1")
@@ -338,18 +348,23 @@ def resolve_event_config(config: AppConfig, overrides: MarkerOverrides) -> Resol
     values.update(overrides.values)
     values.pop("group", None)  # Selection metadata, never a mask parameter or pixel dimension.
     mode = values.get("mode", "box")
-    if mode != "box":
-        raise ConfigError("Mask mode {!r} is not implemented; only box is available".format(mode))
-    invalid = {"expand_x", "expand_y", "close"} & set(overrides.values)
+    for key, value in MODE_PRESETS[mode].items():
+        values.setdefault(key, value)
+    inactive = {"expand_x", "expand_y", "close"} if mode == "box" else {"padding_x", "padding_y", "corner_radius"}
+    invalid = inactive & set(overrides.values)
     if invalid:
-        raise ConfigError("Box row does not accept Organic parameters: {}".format(", ".join(sorted(invalid))))
-    # Future Organic presets may live in global defaults; they cannot affect Box identity.
-    for key in ("expand_x", "expand_y", "close"):
+        raise ConfigError("{} row does not accept {} parameters: {}".format(
+            mode.capitalize(), "Organic" if mode == "box" else "Box", ", ".join(sorted(invalid))))
+    # A project can keep defaults for both shapes. Inactive dimensions must not
+    # affect group equality, provenance, or the current mode's pixel geometry.
+    for key in inactive:
         values.pop(key, None)
     sources = {key: "builtin" for key in MASK_KEYS}
     sources.update(config.mask_sources)
     sources.update({key: source for key, source in overrides.sources.items() if key != "group"})
-    unscaled = ResolvedMaskConfig(**values, sources=sources)
+    for key in inactive:
+        sources[key] = "builtin"
+    unscaled = ResolvedMaskConfig(**values, sources=sources, algorithm_version=MASK_ALGORITHMS[mode])
     scale = config.render["target_height"] / 1080.0
     actual = {key: int(math.floor(getattr(unscaled, key) * scale + 0.5)) for key in INTEGER_KEYS}
     actual["feather_sigma"] = unscaled.feather_sigma * scale

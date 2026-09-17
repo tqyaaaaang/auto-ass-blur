@@ -4,5 +4,6 @@ include native/libass-0.16.0-event-images.patch
 include scripts/build_libass.sh
 include scripts/build_ffmpeg.sh
 include README.md
+recursive-include docs *.md
 include examples/config.yaml
 recursive-include examples *.ass *.json *.yaml

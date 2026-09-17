@@ -150,3 +150,41 @@ def test_diagnostics_cannot_overwrite_config_input(tmp_path):
     with pytest.raises(ValueError, match="路径"):
         run(args)
     assert config.read_text() == "untouched"
+
+
+def test_activity_graph_keeps_reference_default_and_names_safe_targets():
+    from assglass.ffmpeg import ACTIVITY_BLUR_TARGET, ACTIVITY_MERGE_TARGET
+    plan = ProcessingProfileRegistry().resolve(spec())
+    reference = build_graph(plan, 20, False)
+    graph = build_graph(plan, 20, False, activity_commands='activity.cmd')
+    assert 'sendcmd=' not in reference and 'enable=' not in reference
+    assert graph.index('sendcmd=f=activity.cmd') < graph.index('split=2')
+    assert ACTIVITY_BLUR_TARGET + '=sigma=20:steps=2:planes=7:enable=0' in graph
+    assert ACTIVITY_MERGE_TARGET + '=planes=7:enable=0' in graph
+    assert graph.count('setpts=') == reference.count('setpts=') == 1
+    fallback = build_graph(plan, 20, False, activity_commands='activity.cmd', activity_merge=False)
+    assert 'gblur@assglass_blur' in fallback and 'maskedmerge=planes=7[glass]' in fallback
+    for unsafe in ('/tmp/activity.cmd', '../activity.cmd', 'activity.cmd,select=0'):
+        with pytest.raises(ValueError, match='basename'):
+            build_graph(plan, 20, False, activity_commands=unsafe)
+
+
+def test_activity_capabilities_require_sendcmd_and_timeline(monkeypatch):
+    from assglass.ffmpeg import capabilities
+    monkeypatch.setattr('assglass.ffmpeg.executable', lambda path: path)
+    flags = {'gblur': 'TSC', 'maskedmerge': 'TSC', 'sendcmd': '...'}
+    def fake_capture(argv):
+        if '-version' in argv:
+            return 'ffmpeg version 6.1.1' if argv[0] == 'ffmpeg' else 'ffprobe version 6.1.1'
+        if '-filters' in argv:
+            names = ('ass', 'gblur', 'maskedmerge', 'settb', 'setpts', 'setparams', 'showinfo', 'sendcmd')
+            return '\n'.join(' %s %s V->V test' % (flags.get(name, '...'), name)
+                             for name in names if name != 'sendcmd' or name in flags)
+        return 'libx264 AVOptions -crf -aq-mode -aq-strength -deblock'
+    monkeypatch.setattr('assglass.ffmpeg.capture', fake_capture)
+    assert capabilities('ffmpeg', 'ffprobe')['activity_commands']
+    assert capabilities('ffmpeg', 'ffprobe')['activity_merge']
+    del flags['sendcmd']
+    assert not capabilities('ffmpeg', 'ffprobe')['activity_commands']
+    flags['sendcmd'], flags['maskedmerge'] = '...', '.SC'
+    assert not capabilities('ffmpeg', 'ffprobe')['activity_merge']

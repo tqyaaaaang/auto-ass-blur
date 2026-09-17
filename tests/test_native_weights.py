@@ -62,6 +62,37 @@ def test_yuv420p_rejects_odd_dimensions():
         encode_yuv420p_left(RasterMask(), (3, 4))
 
 
+def test_empty_frame_run_reuses_budgeted_zero_buffer_and_keeps_timestamps():
+    from fractions import Fraction
+    from types import SimpleNamespace
+    from assglass.contracts import FrameRequest
+    from assglass.native import NativeBudget
+    from assglass.weights import YUV420PLeftWeightEncoder
+
+    budget = NativeBudget(4096)
+    encoder = YUV420PLeftWeightEncoder(budget)
+    plan = SimpleNamespace(frame_size=(8, 6), pix_fmt='yuv420p', sampler_id=encoder.sampler_id)
+    try:
+        first = encoder.encode(RasterMask(), FrameRequest(0, 0, Fraction(1, 60), (8, 6)), plan)
+        assert budget.used == 72
+        second = encoder.encode(RasterMask(), FrameRequest(1, 1001, Fraction(1, 60000), (8, 6)), plan)
+        assert budget.used == 72
+        assert second.frame_index == 1 and second.pts == 1001
+        assert bytes(first.buffer) == bytes(second.buffer) == bytes(72)
+        first.release()
+        second.release()
+        assert encoder.empty_allocations == 1
+        mask = NativeMask.from_values((0, 0, 1, 1), [1], budget)
+        with_mask = encoder.encode(RasterMask(mask.roi, mask), FrameRequest(2, 2, Fraction(1, 60), (8, 6)), plan)
+        assert encoder._empty_owner is None
+        assert bytes(with_mask.buffer)[0] == 255
+        with_mask.release()
+        mask.release()
+    finally:
+        encoder.close()
+    assert budget.used == 0
+
+
 def test_weight_encoder_substitution_changes_layout_without_changing_mask():
     from fractions import Fraction
     from types import SimpleNamespace

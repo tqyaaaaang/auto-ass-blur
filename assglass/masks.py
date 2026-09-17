@@ -1,21 +1,20 @@
 """Independent mask-builder registry and full-resolution max aggregation."""
 import math
-from .contracts import MaskContext, RasterMask
-from .native import NativeMask, box_mask, union_native
+import struct
+from .contracts import MASK_ALGORITHMS, MaskContext, RasterMask
+from .native import NativeMask, box_mask, organic_mask, union_native
 
 
-class BoxMaskBuilder:
-    name = 'box'
-    algorithm_version = 'roundrect-ss4-opacity-threshold-v2'
+class _NativeMaskBuilder:
 
     def validate_config(self, cfg):
         if cfg.mode != self.name:
-            raise ValueError('BoxMaskBuilder requires mode=box')
+            raise ValueError('%s requires mode=%s' % (type(self).__name__, self.name))
         if cfg.alpha_policy != 'geometry-only':
-            raise ValueError('follow-visual-alpha is not supported in the first release')
+            raise ValueError('follow-visual-alpha is not supported; use geometry-only')
         if cfg.clip_policy != 'expand-after-clip' or cfg.bbox_policy != 'ink':
             raise ValueError('first release requires clip_policy=expand-after-clip and bbox_policy=ink')
-        for key in ('padding_x', 'padding_y', 'corner_radius'):
+        for key in self.pixel_keys:
             value = getattr(cfg, key)
             if type(value) is not int or not 0 <= value <= 1000000:
                 raise ValueError('%s must be a resolved pixel integer in [0,1000000]' % key)
@@ -30,11 +29,49 @@ class BoxMaskBuilder:
         self.validate_config(cfg)
         if context.clip_policy != cfg.clip_policy:
             raise ValueError('mask context/config clip policy mismatch')
-        owner = box_mask(group.images, cfg, context.frame_size, context.budget)
+        owner = self.native_build(group.images, cfg, context.frame_size, context.budget)
         return RasterMask(owner.roi, owner)
 
 
-_BUILDERS = {'box': BoxMaskBuilder}
+class BoxMaskBuilder(_NativeMaskBuilder):
+    name = 'box'
+    algorithm_version = MASK_ALGORITHMS[name]
+    pixel_keys = ('padding_x', 'padding_y', 'corner_radius')
+    native_build = staticmethod(box_mask)
+
+
+class OrganicMaskBuilder(_NativeMaskBuilder):
+    name = 'organic'
+    algorithm_version = MASK_ALGORITHMS[name]
+    pixel_keys = ('expand_x', 'expand_y', 'close')
+    native_build = staticmethod(organic_mask)
+
+
+def geometry_manifest(cfg):
+    """Resolved numeric conventions, independent of selection and video layout."""
+    # The existing Box ABI accepts float32 sigma; Organic accepts double.
+    # Report the actual finite support used by native code, including values
+    # just above/below integer Gaussian-radius boundaries.
+    sigma = struct.unpack('f', struct.pack('f', cfg.feather_sigma))[0] if cfg.mode == 'box' else cfg.feather_sigma
+    radius = math.ceil(3 * sigma)
+    result = {'algorithm_version': MASK_ALGORITHMS[cfg.mode], 'dtype': 'float32',
+              'boundary': 'constant-zero; crop to frame after all operators',
+              'requested_feather_sigma': cfg.feather_sigma,
+              'feather_sigma': sigma, 'feather_radius': radius,
+              'feather_kernel_size': 2 * radius + 1,
+              'opacity_threshold': cfg.opacity_threshold, 'union': 'max'}
+    if cfg.mode == 'organic':
+        result.update(ellipse='integer pixel centers inside ellipse, including boundary; zero axis is a line',
+                      dilation_kernel_shape='ellipse', closing_kernel_shape='rectangle',
+                      dilation_kernel_size=[2 * cfg.expand_x + 1, 2 * cfg.expand_y + 1],
+                      closing_kernel_size=[2 * cfg.close + 1, 2 * cfg.close + 1],
+                      closing_iterations=1,
+                      halo=[cfg.expand_x + 2 * cfg.close + radius, cfg.expand_y + 2 * cfg.close + radius],
+                      source='max coverage/255 for pixels whose coverage*opacity/65025 > threshold')
+    return result
+
+
+_BUILDERS = {'box': BoxMaskBuilder, 'organic': OrganicMaskBuilder}
 
 
 def register_builder(name, factory):

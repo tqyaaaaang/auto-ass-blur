@@ -6,7 +6,7 @@ import math
 import pytest
 
 from assglass.contracts import ImageGroup, MaskContext, RasterMask, ResolvedMaskConfig
-from assglass.masks import create_builder, merge_masks, register_builder
+from assglass.masks import create_builder, geometry_manifest, merge_masks, register_builder
 from assglass.native import NativeBudget, NativeImages, NativeMask, NativeSession, box_mask, ffmpeg_time_ms
 from assglass.weights import encode_yuv420p_left
 
@@ -105,7 +105,7 @@ def test_visual_source_product_never_prematurely_quantized(coverage, opacity):
     native = box_mask(images, config(alpha_policy='follow-visual-alpha'), (4, 4), allow_visual=True)
     values = list(native.weights)
     assert values == pytest.approx([coverage * opacity / 65025] if opacity else [])
-    with pytest.raises(ValueError, match='first release'):
+    with pytest.raises(ValueError, match='follow-visual-alpha is not supported'):
         build(images, config(alpha_policy='follow-visual-alpha'), (4, 4))
 
 
@@ -213,7 +213,7 @@ def test_max_union_preserves_nonrectangular_input_and_factory_boundary():
     union = merge_masks([first, second], MaskContext((4, 4)))
     assert list(union.weights) == pytest.approx([.4, .8, .3])
     with pytest.raises(ValueError, match='not supported'):
-        create_builder('organic')
+        create_builder('unimplemented-shape')
 
 
 def test_allocations_enforce_budget_before_growing_and_release_on_failure():
@@ -226,6 +226,21 @@ def test_allocations_enforce_budget_before_growing_and_release_on_failure():
     assert budget.peak <= budget.limit
     images.release()
     assert budget.used == 0
+
+
+def test_manifest_gaussian_support_matches_existing_box_float32_abi():
+    cfg = config(feather_sigma=1 / 3)
+    report = geometry_manifest(cfg)
+    with NativeImages.empty().append(4, 4, 1, 1, [255]) as images:
+        mask = build(images, cfg, (10, 10))
+        try:
+            assert mask.roi == (2, 2, 7, 7)
+            assert report['feather_radius'] == 2
+            assert report['feather_kernel_size'] == 5
+            assert report['requested_feather_sigma'] == 1 / 3
+            assert report['feather_sigma'] > report['requested_feather_sigma']
+        finally:
+            mask.release()
 
 
 def test_encode_buffer_view_survives_explicit_release():
@@ -301,12 +316,13 @@ def test_timestamp_uses_ffmpeg_double_multiply_then_truncates():
         assert ffmpeg_time_ms(pts, Fraction(1, 60)) == int(float(pts) * (1.0 / 60.0) * 1000.0)
 
 
-def test_sequential_frame_lifetimes_return_budget_to_zero():
+@pytest.mark.parametrize('cache_limit', [0, 4 * 1024 * 1024])
+def test_sequential_frame_lifetimes_return_budget_to_zero(cache_limit):
     from assglass.contracts import FrameRequest
     from assglass.weights import YUV420PLeftWeightEncoder
     from types import SimpleNamespace
     budget = NativeBudget(4 * 1024 * 1024)
-    encoder = YUV420PLeftWeightEncoder(budget)
+    encoder = YUV420PLeftWeightEncoder(budget, limit_bytes=cache_limit)
     plan = SimpleNamespace(frame_size=(384, 288), pix_fmt='yuv420p', sampler_id='left-tent2-v1')
     with NativeSession(ASS, 384, 288, budget=budget) as session:
         for index in range(12):
@@ -320,7 +336,9 @@ def test_sequential_frame_lifetimes_return_budget_to_zero():
             weights.release()
             mask.release()
             images.release()
-            assert budget.used == 0
+            assert budget.used == encoder.bytes_used
+    encoder.close()
+    assert budget.used == 0
     assert 0 < budget.peak < budget.limit
 
 

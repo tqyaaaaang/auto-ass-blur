@@ -4,12 +4,17 @@ marker_prefix: bgblur
 defaults:
   mode: box
   blur_sigma: 40
-  feather_sigma: 12
+  # 省略时使用模式默认：Box 为 12，Organic 为 16；显式值会覆盖两种模式。
+  # feather_sigma: 12
   strength: 1.0
   opacity_threshold: 0.5
   padding_x: 28
   padding_y: 16
   corner_radius: 24
+  # 切换 mode: organic 后使用以下外扩和闭运算半径；Box 忽略这些全局预设。
+  expand_x: 48
+  expand_y: 36
+  close: 48  # 矩形闭运算，97×97 核
   include_types: [character, outline]
 
 selection:
@@ -31,4 +36,7 @@ encoder:
 transport:
   max_in_flight_frames: 4
   max_in_flight_bytes: 67108864
+  mask_cache_bytes: 16777216  # 逐组静态遮罩缓存，计入总预算；0 关闭复用
+  weight_cache_bytes: 16777216  # 最终 YUV 权重缓存，计入同一总预算；0 关闭
+  mask_hash: crc32  # 快速诊断校验；与旧 manifest 对照时可改 sha256
   debug_mask_max_bytes: 1073741824

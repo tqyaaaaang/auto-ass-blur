@@ -16,6 +16,7 @@ import time
 from types import SimpleNamespace
 
 from . import __version__
+from .checksum import WeightStreamChecksum
 from .ffmpeg import (PipePipeline, build_command, build_graph, capabilities,
                      normalize_encoder_options, resolve_encoder, write_all)
 from .runtime import file_hash, verify_ass_runtime
@@ -39,7 +40,7 @@ def parser():
     p.add_argument("--sidecar", type=Path)
     p.add_argument("--allow-merged-box", action="store_true", default=None)
     p.add_argument("--backend", choices=["auto", "alpha", "event-images"])
-    p.add_argument("--grouping", choices=["per-event", "merged"], help="默认逐行/命名组独立背景；merged 为共同大框")
+    p.add_argument("--grouping", choices=["per-event", "merged"], help="默认逐行/命名组独立背景；merged 先合并字形再生成背景")
     p.add_argument("--crf", type=float)
     p.add_argument("--preset")
     p.add_argument("--maxrate")
@@ -51,6 +52,7 @@ def parser():
     p.add_argument("--ffprobe", default=str(bundled / "ffprobe") if (bundled / "ffprobe").is_file() else "ffprobe")
     p.add_argument("--manifest", type=Path)
     p.add_argument("--debug-mask", type=Path, help="显式保存实际三 plane 权重 raw 文件（默认不保存）")
+    p.add_argument("--mask-hash", choices=["crc32", "sha256"], help="权重流诊断校验算法，默认 crc32；sha256 用于旧结果对照")
     p.add_argument("--check-only", action="store_true", help="完成输入、时间轴与运行环境预检，不编码")
     p.add_argument("--overwrite", action="store_true", help="成功验收后替换既有输出")
     p.add_argument("--version", action="version", version=__version__)
@@ -141,8 +143,10 @@ def run(args):
     from .config import resolve_config
     from .selection import build_selection_plan, create_backend
     from .contracts import MaskContext, RasterMask
-    from .masks import create_builder, merge_masks
+    from .masks import create_builder, geometry_manifest, merge_masks
     from .native import NativeBudget, libass_info
+    from .cache import MaskCache
+    from .activity import scan_activity, group_may_need_blur
 
     started = time.monotonic()
     output = args.output.expanduser().resolve()
@@ -174,6 +178,8 @@ def run(args):
             raise ValueError("目标已存在；如需替换请使用 --overwrite: " + str(path))
 
     overrides = {}
+    if args.mask_hash is not None:
+        overrides["transport"] = {"mask_hash": args.mask_hash}
     if args.fonts_dir is not None:
         overrides["render"] = {"fonts_dir": str(args.fonts_dir.resolve())}
     if args.allow_merged_box is not None or args.backend is not None or args.grouping is not None:
@@ -210,6 +216,9 @@ def run(args):
     if audio_codec not in ("copy", "aac", "none"):
         raise ValueError("audio_codec 必须为 copy/aac/none")
     caps = capabilities(args.ffmpeg, args.ffprobe)
+    if not caps.get("activity_commands") or not caps.get("activity_merge"):
+        raise ValueError("空帧快速路径需要 FFmpeg sendcmd 及 gblur/maskedmerge timeline 支持；"
+                         "请运行 sh scripts/build_ffmpeg.sh 更新项目私有 FFmpeg，或指定具备这些滤镜的 --ffmpeg")
     log("FFmpeg：" + caps["ffmpeg"])
     log("正在验证视频格式与完整 PTS 时间轴…")
     spec = VideoProbe(caps["ffprobe"]).inspect(video)
@@ -238,7 +247,7 @@ def run(args):
                               "time_conversion": "int64(double(pts) * double(num)/double(den) * 1000), no accumulation"}
         preflight_seconds = time.monotonic() - started
         budget = NativeBudget(cfg.transport["max_in_flight_bytes"])
-        weight_encoder = plan.make_weight_encoder(budget)
+        weight_encoder = plan.make_weight_encoder(budget, cfg.transport["weight_cache_bytes"])
         profile = SimpleNamespace(frame_size=plan.frame_size, width=spec.width, height=spec.height,
                                   fonts_dir=fonts_dir, native_budget=budget, max_bytes=budget.limit,
                                   profile_id="ffmpeg-ass-mirrored-v1")
@@ -249,6 +258,13 @@ def run(args):
         builders.update({target.config.mode: create_builder(target.config.mode) for target in selection_plan.targets})
         for target in selection_plan.targets:
             builders[target.config.mode].validate_config(target.config)
+        manifest["mask_geometry"] = {
+            "default": geometry_manifest(selection_plan.default_config),
+            "targets": [{"event_index": target.index, **geometry_manifest(target.config)}
+                        for target in selection_plan.targets],
+        }
+        if cfg.selection["grouping"] == "merged" and "organic" in builders:
+            log("Organic merged：同时活动的目标先合并字形，再统一外扩和闭运算；各目标须使用相同参数。")
         native_info = libass_info()
         manifest["runtime"] = verify_ass_runtime(caps, work, native_info["path"], int(native_info["version_hex"], 16), bool(fonts_dir))
         manifest["runtime"]["event_export_abi"] = native_info.get("event_export_abi", 0)
@@ -270,21 +286,39 @@ def run(args):
 
         if args.debug_mask and ledger.count * plan.frame_bytes > cfg.transport["debug_mask_max_bytes"]:
             raise ValueError("debug mask 超出 debug_mask_max_bytes；提高配置上限或取消 --debug-mask")
-        graph = build_graph(plan, cfg.video_blur.blur_sigma, cfg.output.burn_subtitles, bool(fonts_dir))
+        log("正在扫描需要背景模糊的帧；透明、关闭或无目标的帧将旁路模糊…")
+        activity = scan_activity(backend, prepared, ledger, work / "activity.cmd", work / "activity.flags",
+                                 progress=lambda n: log(f"背景活动扫描 {n}/{ledger.count} 帧"))
+        manifest["activity"] = {key: value for key, value in activity.items()
+                                if key not in ("command_path", "flags_path")}
+        log(f"背景模糊 {activity['active_frames']} 帧，旁路 {activity['inactive_frames']} 帧。")
+        graph = build_graph(plan, cfg.video_blur.blur_sigma, cfg.output.burn_subtitles, bool(fonts_dir),
+                            activity_commands="activity.cmd")
         temporary_output = work / ("output" + output.suffix.lower())
         argv = build_command(caps, plan, encoder, graph, temporary_output, cfg.runtime,
                              cfg.transport["max_in_flight_frames"], audio_codec)
         manifest["ffmpeg_argv"] = argv
         manifest["filtergraph"] = graph
         session = backend.open(prepared)
+        cache = MaskCache(cfg.transport["mask_cache_bytes"], budget)
         pipeline = None
         debug = None
-        mask_digest = hashlib.sha256()
-        stage_times = {"render": 0.0, "mask": 0.0, "weights": 0.0, "pipe_wait": 0.0}
+        activity_flags = None
+        mask_digest = WeightStreamChecksum(cfg.transport["mask_hash"])
+        stage_times = {"render": 0.0, "mask": 0.0, "weights": 0.0, "checksum": 0.0, "pipe_wait": 0.0}
         context = MaskContext(plan.frame_size, budget)
+        skipped_mask_frames = 0
+        skipped_groups = 0
+
+        def with_reclaim(operation):
+            # Both caches are optional and share the same working allocation
+            # budget. Retrying retains the current frame's independent owners.
+            return weight_encoder.run_with_reclaim(lambda: cache.run_with_reclaim(operation))
+
         last_report = time.monotonic()
         try:
             pipeline = PipePipeline(argv, work, work / "ffmpeg.log", ledger.count, plan.ticks_per_frame)
+            activity_flags = (work / "activity.flags").open("rb")
             if args.debug_mask:
                 debug = (work / "mask.raw").open("wb", buffering=0)
             log(f"开始处理 {ledger.count} 帧；字幕烧录{'开启' if cfg.output.burn_subtitles else '关闭'}。")
@@ -293,24 +327,38 @@ def run(args):
                 masks = []
                 try:
                     before = time.monotonic()
-                    selection = session.render(frame)
+                    selection = with_reclaim(lambda: session.render(frame))
                     stage_times["render"] += time.monotonic() - before
                     before = time.monotonic()
-                    for group in selection.groups:
-                        masks.append(builders[group.effect_config.mode].build(group, group.effect_config, context))
+                    active = activity_flags.read(1)
+                    if active not in (b"\0", b"\1"):
+                        raise ValueError("背景活动记录帧数/内容损坏")
+                    cache.begin_frame(selection, prepared.profile_digest)
+                    if active == b"\0":
+                        cache.evict_all()
+                        skipped_mask_frames += 1
+                    else:
+                        for group in selection.groups:
+                            if not group_may_need_blur(group, frame.frame_size):
+                                skipped_groups += 1
+                                continue
+                            masks.append(with_reclaim(lambda: cache.build(
+                                group, group.effect_config, context, builders[group.effect_config.mode])))
                     if len(masks) == 1:
                         mask = masks.pop()
                     elif masks:
-                        mask = merge_masks(masks, context)
+                        mask = with_reclaim(lambda: merge_masks(masks, context))
                     else:
                         mask = RasterMask()
                     stage_times["mask"] += time.monotonic() - before
                     before = time.monotonic()
-                    weight = weight_encoder.encode(mask, frame, plan)
+                    weight = with_reclaim(lambda: weight_encoder.encode(mask, frame, plan))
                     stage_times["weights"] += time.monotonic() - before
                     view = weight.buffer
                     try:
-                        mask_digest.update(view)
+                        before = time.monotonic()
+                        mask_digest.update(weight)
+                        stage_times["checksum"] += time.monotonic() - before
                         if debug:
                             write_all(debug, view)
                         before = time.monotonic()
@@ -331,6 +379,8 @@ def run(args):
                 if now - last_report >= 2:
                     log(f"已发送 {frame.frame_index + 1}/{ledger.count} 帧；应用缓冲峰值 {budget.peak / 1048576:.1f} MiB")
                     last_report = now
+            if activity_flags.read(1):
+                raise ValueError("背景活动记录有多余帧")
             manifest["transport"] = pipeline.finish()
             if debug:
                 debug.close()
@@ -339,10 +389,21 @@ def run(args):
             if (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns) != source_identity:
                 raise ValueError("处理期间输入视频被修改，拒绝发布")
             manifest["verification"] = verify_output(temporary_output, plan, ledger.count, caps["ffprobe"], encoder["options"]["level"])
-            manifest["mask_sha256"] = mask_digest.hexdigest()
+            manifest["mask_checksum"] = mask_digest.manifest()
+            if mask_digest.algorithm == "sha256":
+                manifest["mask_sha256"] = mask_digest.hexdigest()
             manifest["helper_render_log"] = session.logs
+            manifest["optimization"] = {"mask_cache": cache.metrics,
+                                         "weight_cache": weight_encoder.metrics,
+                                         "checksum": mask_digest.metrics,
+                                         "skipped_mask_frames": skipped_mask_frames,
+                                         "skipped_groups_in_active_frames": skipped_groups,
+                                         "empty_weight_frames": weight_encoder.empty_frames,
+                                         "empty_weight_allocations": weight_encoder.empty_allocations}
             manifest["memory"] = {"max_in_flight_bytes": budget.limit, "native_peak_bytes": budget.peak,
-                                  "application_frames_in_flight": 1, "cache_bytes": 0,
+                                  "application_frames_in_flight": 1, "cache_bytes": cache.bytes_used,
+                                  "cache_peak_bytes": cache.metrics["peak_bytes"],
+                                  "cache_limit_bytes": cache.limit_bytes,
                                   "excludes": "FFmpeg internal queues/encoder, OS pipe, libass/font caches, ASS metadata"}
             manifest["timings"] = {"preflight_seconds": preflight_seconds, "total_seconds": time.monotonic() - started,
                                    "stages_seconds": stage_times}
@@ -359,6 +420,10 @@ def run(args):
         finally:
             if debug:
                 debug.close()
+            if activity_flags:
+                activity_flags.close()
+            weight_encoder.close()
+            cache.close()
             if pipeline is not None:
                 pipeline.close()
             session.close()

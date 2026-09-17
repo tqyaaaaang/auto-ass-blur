@@ -48,7 +48,7 @@ cd "$assglass_build_dir/source"
   --enable-decoder=h264,rawvideo,aac,pcm_s16le,wrapped_avframe \
   --enable-encoder=libx264,rawvideo,wrapped_avframe,aac \
   --enable-parser=h264,aac \
-  --enable-filter=ass,gblur,maskedmerge,split,format,setparams,settb,setpts,showinfo,select,color,testsrc2,crop,scale,null,anull \
+  --enable-filter=ass,gblur,maskedmerge,sendcmd,split,format,setparams,settb,setpts,showinfo,select,color,testsrc2,crop,scale,null,anull \
   --enable-indev=lavfi
 make -j "${ASSGLASS_BUILD_JOBS:-4}"
 

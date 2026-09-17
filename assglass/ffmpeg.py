@@ -17,6 +17,9 @@ ENCODER_DEFAULTS = {"crf": 18, "deblock": "-1:-1", "preset": "veryslow", "level"
                     "subq": 10, "b:v": "10M", "maxrate": "20M", "bufsize": "10M"}
 ENCODER_ALIASES = {"vb": "b:v", "b": "b:v", "level:v": "level", "flags:v": "flags"}
 ENCODER_FLAGS = {"level": "level:v", "flags": "flags:v"}
+ACTIVITY_COMMAND_BASENAME = "activity.cmd"
+ACTIVITY_BLUR_TARGET = "gblur@assglass_blur"
+ACTIVITY_MERGE_TARGET = "maskedmerge@assglass_merge"
 
 
 def normalize_encoder_options(options):
@@ -120,8 +123,11 @@ def capabilities(ffmpeg, ffprobe):
     for name in ("crf", "aq-mode", "aq-strength", "deblock"):
         if "-" + name not in enc:
             raise ValueError("libx264 缺少选项: " + name)
+    filter_flags = {name: flags for flags, name in re.findall(r"^\s*([TSC.]{3})\s+(\w+)\s", filters, re.MULTILINE)}
     return {"ffmpeg": ffmpeg, "ffprobe": ffprobe, "version": version.strip(),
-            "ffprobe_version": probe_version.strip(), "fps_mode": tuple(map(int, m.groups())) >= (5, 1)}
+            "ffprobe_version": probe_version.strip(), "fps_mode": tuple(map(int, m.groups())) >= (5, 1),
+            "activity_commands": "sendcmd" in filter_flags and "T" in filter_flags.get("gblur", ""),
+            "activity_merge": "T" in filter_flags.get("maskedmerge", "")}
 
 
 def cpu_threads():
@@ -147,14 +153,37 @@ def thread_count(value):
     return int(value)
 
 
-def build_graph(plan, sigma, burn_subtitles, fonts=False, observe=True):
+def build_graph(plan, sigma, burn_subtitles, fonts=False, observe=True,
+                activity_commands=None, activity_merge=True):
+    """Build the reference graph or its activity-controlled equivalent.
+
+    The activity file contains finite, half-open sendcmd intervals and sends
+    ``enable 0/1`` to ACTIVITY_BLUR_TARGET and (when enabled) ACTIVITY_MERGE_TARGET.
+    Commands run before split, so frame zero is configured before either branch
+    consumes it. Frame timestamps, source branches and the mask stream remain
+    intact; disabled gblur forwards its input, while maskedmerge's internal
+    timeline path clones the synchronized base without blending pixels.
+
+    FFmpeg's timeline command contract and native implementations:
+    https://ffmpeg.org/ffmpeg-filters.html#Timeline-editing
+    https://github.com/FFmpeg/FFmpeg/blob/n6.1.1/libavfilter/vf_maskedmerge.c
+    https://github.com/FFmpeg/FFmpeg/blob/n6.1.1/libavfilter/vf_gblur.c
+    """
     tb = str(plan.spec.time_base)
-    # Private working directory gives the ASS and font inputs safe fixed names.
-    graph = (f"[0:{plan.spec.stream['index']}]format=pix_fmts=yuv420p,split=2[base][tmp];"
-             f"[tmp]gblur=sigma={sigma:g}:steps=2:planes=7[blurred];"
+    controlled = activity_commands is not None
+    if controlled and str(activity_commands) != ACTIVITY_COMMAND_BASENAME:
+        raise ValueError("activity commands must use the private fixed basename activity.cmd")
+    control = "sendcmd=f=activity.cmd," if controlled else ""
+    blur = ACTIVITY_BLUR_TARGET if controlled else "gblur"
+    merge = ACTIVITY_MERGE_TARGET if controlled and activity_merge else "maskedmerge"
+    blur_enable = ":enable=0" if controlled else ""
+    merge_enable = ":enable=0" if controlled and activity_merge else ""
+    # Private working directory gives the ASS, fonts and commands safe names.
+    graph = (f"[0:{plan.spec.stream['index']}]format=pix_fmts=yuv420p,{control}split=2[base][tmp];"
+             f"[tmp]{blur}=sigma={sigma:g}:steps=2:planes=7{blur_enable}[blurred];"
              "[1:v]setparams=range=limited:color_primaries=bt709:color_trc=bt709:colorspace=bt709,"
              f"settb=expr={tb},setpts=N*{plan.ticks_per_frame}[mask];"
-             "[base][blurred][mask]maskedmerge=planes=7[glass];"
+             f"[base][blurred][mask]{merge}=planes=7{merge_enable}[glass];"
              f"[glass]settb=expr={tb}")
     if observe:
         graph += ",showinfo"
@@ -225,6 +254,13 @@ class PipePipeline:
                         self.observed += 1
                     if "auto_scale" in line and not self.errors:
                         self.errors.append("FFmpeg 插入非预期的像素转换: " + line.strip())
+                    if "Command reply for command" in line and "ret:" in line:
+                        reply = line.split("ret:", 1)[1].split(" res:", 1)[0].strip()
+                        # av_err2str(0) follows libc: glibc says Success, Darwin
+                        # says Undefined error: 0. A failed sendcmd otherwise
+                        # only logs its reply and can still yield exit code 0.
+                        if reply not in ("Success", "Undefined error: 0") and not self.errors:
+                            self.errors.append("FFmpeg 活动区间命令失败: " + line.strip())
                     if "fontselect:" in line or "Using font provider" in line:
                         if len(self.font_lines) < 256:
                             self.font_lines.add(line.strip())

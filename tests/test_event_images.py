@@ -24,6 +24,11 @@ from test_ass import HEADER
 SIZE = (640, 360)
 
 
+def test_event_images_native_allocation_retry_preserves_frame_sequence():
+    from test_cache import assert_render_budget_recovery
+    assert_render_budget_recovery('event-images')
+
+
 def dialogue(text, actor="bgblur", start="0:00:00.00", end="0:00:01.00",
              layer=0, effect=""):
     return "Dialogue: {},{},{},Default,{},0,0,0,{},{}\n".format(
@@ -144,6 +149,48 @@ def test_distinct_simultaneous_groups_keep_independent_effect_parameters():
             assert at(mask, 90, 85) == .25
             assert at(mask, 450, 265) == .75
             assert at(mask, 300, 180) == 0
+
+
+@pytest.mark.parametrize("backend,grouping,named,bridge", [
+    ("event-images", "per-event", False, 0),
+    ("event-images", "per-event", True, 1),
+    ("alpha", "merged", False, 1),
+])
+def test_organic_closing_is_per_group_not_across_unrelated_events(backend, grouping, named, bridge):
+    actor = "bgblur{group=joined}" if named else "bgblur"
+    source = source_of(dialogue(rectangle(60, 70, 20, 30), actor=actor),
+                       dialogue(rectangle(84, 70, 20, 30), actor=actor))
+    cfg = resolve_config({
+        "selection": {"backend": backend, "grouping": grouping},
+        "defaults": {"mode": "organic", "expand_x": 0, "expand_y": 0,
+                     "close": 4, "feather": 0},
+    })
+    budget = NativeBudget(8 * 1024 * 1024)
+    profile = SimpleNamespace(frame_size=SIZE, fonts_dir=None, native_budget=budget,
+                              profile_id="organic-group-fixture")
+    provider = create_backend(backend)
+    prepared = provider.preflight(source, build_selection_plan(source, cfg), profile)
+    with provider.open(prepared) as session, session.render(request(0)) as selected:
+        with mask_for(selected, budget) as mask:
+            assert at(mask, 70, 85) == 1
+            assert at(mask, 94, 85) == 1
+            assert at(mask, 82, 85) == bridge
+            assert at(mask, 82, 50) == 0
+
+
+def test_organic_and_box_coexist_with_distinct_shapes_and_parameters():
+    # Two disconnected pieces of one ASS drawing have the same bbox in both
+    # events. Organic retains the gap; Box intentionally fills its rectangle.
+    drawing = r"{\an7\pos(%d,70)\bord0\shad0\p1}m 0 0 l 20 0 20 20 0 20 m 60 0 l 80 0 80 20 60 20"
+    source = source_of(
+        dialogue(drawing % 60, actor="bgblur{mode=organic;expand_x=0;expand_y=0;close=0;strength=0.75}"),
+        dialogue(drawing % 420, actor="bgblur{strength=0.25}"))
+    with opened(source) as (session, budget), session.render(request(0)) as selected:
+        assert {group.effect_config.mode for group in selected.groups} == {"organic", "box"}
+        with mask_for(selected, budget) as mask:
+            assert at(mask, 70, 80) == .75
+            assert at(mask, 100, 80) == 0
+            assert at(mask, 460, 80) == .25
 
 
 def test_conflicting_parameters_are_rejected_only_within_active_shared_group():

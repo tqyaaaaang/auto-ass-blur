@@ -67,9 +67,9 @@ class ProcessingPlan:
     def frame_bytes(self):
         return self.spec.width * self.spec.height * 3 // 2
 
-    def make_weight_encoder(self, budget=None):
+    def make_weight_encoder(self, budget=None, limit_bytes=None):
         from .weights import YUV420PLeftWeightEncoder
-        return YUV420PLeftWeightEncoder(budget)
+        return YUV420PLeftWeightEncoder(budget, limit_bytes=limit_bytes)
 
 
 class VideoProbe:

@@ -13,6 +13,11 @@ from test_ass import HEADER, document
 PROFILE = SimpleNamespace(frame_size=(640, 360), fonts_dir=None, profile_id="test-fixture")
 
 
+def test_alpha_native_allocation_retry_preserves_frame_sequence():
+    from test_cache import assert_render_budget_recovery
+    assert_render_budget_recovery('alpha')
+
+
 def alpha_config(project=None):
     """Keep the original Alpha compatibility suite explicit about legacy grouping."""
     values = dict(project or {})
