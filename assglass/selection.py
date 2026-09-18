@@ -62,7 +62,8 @@ class SelectionPlan:
 
     def manifest(self):
         return {"selection_digest": self.digest, "marker_field": "Actor/Name", "marker_prefix": self.app_config.marker_prefix,
-                "marker_semantics": "raw, case-sensitive startswith", "backend": self.app_config.selection["backend"],
+                "marker_semantics": "case-sensitive exact name in top-level semicolon-separated Actor identifiers; optional parenthesized parameters",
+                "backend": self.app_config.selection["backend"],
                 "grouping": self.app_config.selection["grouping"],
                 "targets": [{"event_index": target.index, "event_key": target.event.key,
                     "line_number": target.event.line_number, "start_ms": target.event.start_ms,

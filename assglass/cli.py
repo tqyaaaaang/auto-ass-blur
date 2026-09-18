@@ -24,12 +24,12 @@ from .video import ProcessingProfileRegistry, VideoProbe, verify_output, verify_
 
 
 def parser():
-    p = argparse.ArgumentParser(description="为 ASS Actor/Name 字段带前缀标记的字幕生成背景高斯模糊，并同次压制字幕。")
+    p = argparse.ArgumentParser(description="为 ASS Actor/Name 字段含指定标识的字幕生成背景高斯模糊，并同次压制字幕；标识以分号分隔，参数写为 bgblur(key=value;...)。")
     p.add_argument("video", type=Path)
     p.add_argument("subtitle", type=Path)
     p.add_argument("-o", "--output", required=True, type=Path)
     p.add_argument("--config", type=Path, help="YAML 或 JSON 项目配置")
-    p.add_argument("--marker-prefix", help="Actor 字段前缀，默认 bgblur；大小写敏感")
+    p.add_argument("--marker-prefix", help="Actor 标识名称，默认 bgblur；去除两侧空白后精确匹配，大小写敏感（选项名保留兼容）")
     p.add_argument("--default", action="append", default=[], metavar="KEY=VALUE")
     p.add_argument("--blur-sigma", type=float)
     group = p.add_mutually_exclusive_group()

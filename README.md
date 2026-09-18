@@ -2,7 +2,7 @@
 
 `assglass` 根据 ASS 字幕的实际渲染位置，模糊标记字幕后方的视频，再将完整字幕烧入视频。背景处理和字幕烧录在同一次视频编码中完成，字幕字形本身保持清晰。
 
-实现以 [`PLAN/ass_bgblur_technical_design_v1.10.md`](PLAN/ass_bgblur_technical_design_v1.10.md) 为基础：完整 libass track 分析、Box／Organic 背景、原生 YUV420 权重和流式 FFmpeg 合成，并已加入 EventImages 逐事件导出与独立字幕组。**标记使用 Actor 字段（ASS 文件中的 `Name`），按可配置前缀匹配，默认 `bgblur`**；不使用 Effect 精确匹配。
+实现以 [`PLAN/ass_bgblur_technical_design_v1.10.md`](PLAN/ass_bgblur_technical_design_v1.10.md) 为基础：完整 libass track 分析、Box／Organic 背景、原生 YUV420 权重和流式 FFmpeg 合成，并已加入 EventImages 逐事件导出与独立字幕组。**标记使用 Actor 字段（ASS 文件中的 `Name`），在分号分隔的标识中精确匹配可配置名称，默认 `bgblur`**；可与 `x3border(...)` 等其他预处理标识共存。
 
 ## 使用前准备
 
@@ -66,19 +66,24 @@ Dialogue: 0,0:00:01.00,0:00:03.00,Default,bgblur,0,0,0,,这行字幕有模糊背
 Dialogue: 0,0:00:03.00,0:00:05.00,Default,旁白,0,0,0,,这行正常显示，但不添加背景模糊
 ```
 
-前缀匹配区分大小写：`bgblur`、`bgblur_角色A`、`bgblurred` 都是标记；`notbgblur` 和 `BGBlur` 不是。`Comment` 行不是目标。Effect 原有内容保留，正文 Text 中的逗号也保留。
+Actor 可以包含多个标识，以**圆括号外的分号**分隔；只要其中一个名称是 `bgblur`，该 Dialogue 就是目标，标识的顺序不受限制。名称区分大小写、去除两侧空白后精确匹配：`bgblurred`、`bgblur_角色A`、`notbgblur` 和 `BGBlur` 都不会匹配。其他标识的参数不会被当成独立标识，`x3border(note=bgblur)` 不会触发背景模糊。
 
-Actor 开头的空格不会自动去除，因此 ` bgblur` 不匹配。参数块必须紧跟配置的前缀；例如 `bgblur_角色A{strength=0.5}` 仍仅表示一个带后缀的标记名，使用默认参数。需要逐行参数时使用下面的标准写法。
-
-可以在 Actor 标记后设置逐行外观参数：
+逐行参数写在标识后的圆括号中，使用 `key=value`，参数之间也以**分号**分隔。例如：
 
 ```text
-bgblur{feather=8;strength=0.65;padding_x=40;padding_y=24;radius=20}
-bgblur;feather=8;strength=0.65
-bgblur{threshold=0.5;padding_x=28;padding_y=16}
+bgblur(feather=8; strength=0.65; padding_x=40; padding_y=24; radius=20)
+x3border(c1=FFFFFF; b1=9); bgblur(threshold=0.5; padding_x=28; padding_y=16)
+bgblur(mode=organic); x3border(c1=FFFFFF; b1=9)
+bgblur;
 ```
 
-参数之间使用**分号**。Actor 不是带引号的 CSV 字段，逗号会打乱 ASS 字段，不能写 `bgblur{feather=8,strength=0.65}`。
+标识和参数两侧的空白会被忽略；`bgblur`、`bgblur()` 都使用默认参数，结尾的分号和空标识也允许，因此 `bgblur;` 无需预先规范化。程序只解释自己的标识，保留 `x3border` 等其他内容，但不会替你执行对应的预处理。`Comment` 行不是目标；Effect 原有内容和正文 Text 中的逗号均保留。
+
+同一 Actor 中可以重复 `bgblur`：`bgblur(feather=8); bgblur(strength=0.65)` 合并为一组逐行参数。跨多个标识重复同一参数的相同值也允许，给出不同值时会报错；单个参数块内仍不允许重复参数名（包括别名）。Actor 不是带引号的 CSV 字段，逗号会打乱 ASS 字段，不能写 `bgblur(feather=8,strength=0.65)`。
+
+自定义名称仍使用 `--marker-prefix glass` 或配置项 `marker_prefix: glass`。选项名保留兼容，但含义改为精确匹配一个标识，例如 `x3border(...); glass(strength=0.65)`。
+
+**旧写法迁移：**将 `bgblur{feather=8;strength=0.65}` 和 `bgblur;feather=8;strength=0.65` 改为 `bgblur(feather=8;strength=0.65)`。括号外的内容是独立标识，不再作为 `bgblur` 的参数；旧的 `bgblur_角色A` 等前缀后缀写法也需改为独立的 `bgblur` 标识，需要分组时使用 `bgblur(group=角色A)`。
 
 如果需要保留原 Actor 内容，也可以用 sidecar 选择行：
 
@@ -100,13 +105,13 @@ sidecar 绑定完整 ASS 的 SHA-256；编辑、重排或重新保存 ASS 后，
 同一句字幕由正文、白描边、黑描边等多行构成时，在这些行的 Actor 中使用相同的 `group`：
 
 ```text
-bgblur{group=comment}   # “说不定这段就被剪掉了”
-bgblur{group=why}       # “为啥——！”正文层
-bgblur{group=why}       # “为啥——！”白描边层
-bgblur{group=why}       # “为啥——！”黑描边层
+bgblur(group=comment)   # “说不定这段就被剪掉了”
+bgblur(group=why)       # “为啥——！”正文层
+bgblur(group=why)       # “为啥——！”白描边层
+bgblur(group=why)       # “为啥——！”黑描边层
 ```
 
-填写 Actor 时只填写左侧标记，不包含示例注释。组名区分大小写，可含中英文、数字、下划线、点和连字符，长度1～128。未写 `group` 的每一行独立；`bgblur_why` 仍只是前缀匹配，不会隐式创建组。`group` 也可放进 sidecar 每条事件的 `overrides`，但不能作为全局 mask 默认值。
+填写 Actor 时只填写左侧标记，不包含示例注释。组名区分大小写，可含中英文、数字、下划线、点和连字符，长度1～128。未写 `group` 的每一行独立；`bgblur_why` 不会匹配标记或隐式创建组。`group` 也可放进 sidecar 每条事件的 `overrides`，但不能作为全局 mask 默认值。
 
 同组的当前活动事件先合并字形与描边图像，再求一个框，因此多层样式不会丢失外沿。不同组可同时使用不同的 padding、feather、strength、threshold 等参数；同组同时活动的行必须具有相同的有效参数，冲突会在编码前指出。时间不重叠的行可以复用组名并采用不同参数。
 
@@ -156,9 +161,9 @@ assglass input.mp4 subtitle.ass -o organic.mp4 \
 也可以仅在需要的行的 Actor 中写入：
 
 ```text
-bgblur{mode=organic}
-bgblur{mode=organic;expand_x=48;expand_y=36;close=48;feather=16}
-bgblur{group=why;mode=organic;close=10}
+bgblur(mode=organic)
+bgblur(mode=organic;expand_x=48;expand_y=36;close=48;feather=16)
+bgblur(group=why;mode=organic;close=10)
 ```
 
 | Organic 参数 | 默认值 | 作用 |
@@ -228,7 +233,7 @@ assglass input.mp4 subtitle.ass -o output.mp4
 # 只处理背景，不新增硬字幕
 assglass input.mp4 subtitle.ass -o background.mp4 --no-burn-subtitles
 
-# 自定义 Actor 前缀
+# 自定义 Actor 标识名称（精确匹配，选项名保留兼容）
 assglass input.mp4 subtitle.ass -o output.mp4 --marker-prefix glass
 
 # 调整视频模糊强度和默认背景外观

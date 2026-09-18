@@ -9,38 +9,85 @@ from test_ass import document
 
 
 class MarkerTests(unittest.TestCase):
-    def test_actor_literal_prefix_semantics(self):
-        for actor in ("bgblur", "bgblurred", "bgblurSpeaker", "bgblur 文字", "bgblurSuffix{feather=99}"):
+    def test_exact_identifier_anywhere_and_empty_outer_items(self):
+        for actor in ("bgblur", " bgblur ", "bgblur;", "; ; bgblur ;;", "bgblur()",
+                      "bgblur(  )", "speaker;bgblur", "bgblur; x3border", "speaker; bgblur ; tail"):
             with self.subTest(actor=actor):
-                self.assertEqual(parse_marker(actor).values, {})
-        for actor in ("notbgblur", "BGBlur", " bgblur", "speaker;bgblur", ""):
-            self.assertIsNone(parse_marker(actor))
-        self.assertIsNotNone(parse_marker("背景角色", "背景"))
+                marker = parse_marker(actor)
+                self.assertEqual(marker.values, {})
+                self.assertEqual(marker.raw_marker, actor)
+        for actor in ("", "notbgblur", "BGBlur", "bgblurred", "bgblurSpeaker", "bgblur_角色A",
+                      "bgblur 文字", "bgblurSuffix(feather=99)", "speaker;BGBlur"):
+            with self.subTest(actor=actor):
+                self.assertIsNone(parse_marker(actor))
 
-    def test_brace_legacy_aliases_and_explicit_zero(self):
-        first = parse_marker("bgblur{ feather = 0 ; strength=0;radius=10;include=shadow+character}")
-        second = parse_marker("bgblur;feather_sigma=0;strength=0;corner_radius=10;include_types=character+shadow")
+    def test_other_preprocessors_keep_their_own_parameters(self):
+        other = "x3border(c1=FFFFFF;b1=9;strength=9;unknown=anything)"
+        for actor in (other + "; bgblur(feather=8; strength=0.65)",
+                      "bgblur ( feather=8; strength=0.65 ); " + other):
+            with self.subTest(actor=actor):
+                marker = parse_marker(actor)
+                self.assertEqual(marker.values, {"feather_sigma": 8, "strength": .65})
+                self.assertEqual(marker.sources, {"feather_sigma": "actor", "strength": "actor"})
+        # Names and even complete marker expressions inside foreign parameters
+        # are opaque. Nested delimiters never create extra top-level tags.
+        self.assertIsNone(parse_marker("x3border(note=bgblur;bgblur(strength=0))"))
+        self.assertEqual(parse_marker("other(nested(a;b));bgblur").values, {})
+        self.assertIsNone(parse_marker("other(nested(bgblur);bgblur)"))
+        self.assertIsNone(parse_marker("x3border(unclosed;bgblur"))
+        self.assertEqual(parse_marker("bgblur;strength=0.2").values, {})
+
+    def test_parenthesized_aliases_and_explicit_zero(self):
+        first = parse_marker("bgblur( feather = 0 ; strength=0;radius=10;include=shadow+character)")
+        second = parse_marker("bgblur(feather_sigma=0;strength=0;corner_radius=10;include_types=character+shadow)")
         self.assertEqual(first.values, second.values)
         self.assertEqual(first.values["strength"], 0)
-        self.assertEqual(parse_marker("bgblur{}").values, {})
+
+    def test_configured_identifier_is_literal_and_case_sensitive(self):
+        actor = "bgblur; x3border(c1=FFFFFF;b1=9); 背景(group=台词; strength=0.5)"
+        marker = parse_marker(actor, "背景")
+        self.assertEqual(marker.values, {"group": "台词", "strength": .5})
+        self.assertIsNone(parse_marker("背景角色", "背景"))
+        self.assertIsNone(parse_marker("glassred; Glass", "glass"))
+        self.assertEqual(parse_marker("other; my.blur(strength=0)", "my.blur").values, {"strength": 0})
+        for name in ("", " ", "bg blur", " bgblur", "bgblur ", "bgblur(x)", "a;b", "a=b",
+                     "a,b", "a{b}", "bgblur\n", "bgblur\x00", None, 1):
+            with self.subTest(name=name), self.assertRaises(ConfigError):
+                parse_marker("bgblur", name)
+
+    def test_repeated_markers_merge_only_compatible_overrides(self):
+        marker = parse_marker("bgblur;bgblur(strength=0.5;feather=16);other;bgblur(feather_sigma=16;group=why)")
+        self.assertEqual(marker.values, {"strength": .5, "feather_sigma": 16, "group": "why"})
+        for actor in ("bgblur(strength=0);bgblur(strength=1)",
+                      "bgblur(feather=4);bgblur(feather_sigma=5)",
+                      "bgblur(group=left);bgblur(group=right)"):
+            with self.subTest(actor=actor), self.assertRaisesRegex(ConfigError, "Conflicting repeated"):
+                parse_marker(actor)
 
     def test_invalid_parameters(self):
-        examples = ("bgblur{feather=2", "bgblur{feather=2}suffix", "bgblur{feather=2;}", "bgblur;",
-                    "bgblur{feather=2;;strength=1}", "bgblur{feather=1;feather_sigma=1}", "bgblur{=1}",
-                    "bgblur{strength=}", "bgblur{unknown=1}", "bgblur{radius=-1}", "bgblur{strength=1.1}",
-                    "bgblur{feather=NaN}", "bgblur{feather=Inf}", "bgblur{padding_x=-1.5}",
-                    "bgblur{include=character+character}", "bgblur{include=bogus}", "bgblur{{feather=2}}",
-                    "bgblur{sigma=18}", "bgblur{blur=18}", "bgblur{blur_sigma=18}", "bgblur{burn_subtitles=false}")
+        examples = ("bgblur(feather=2", "bgblur(feather=2)suffix", "bgblur(feather=2;)",
+                    "bgblur(feather=2;;strength=1)", "bgblur(feather=1;feather_sigma=1)", "bgblur(=1)",
+                    "bgblur(strength=)", "bgblur(unknown=1)", "bgblur(radius=-1)", "bgblur(strength=1.1)",
+                    "bgblur(feather=NaN)", "bgblur(feather=Inf)", "bgblur(padding_x=-1.5)",
+                    "bgblur(include=character+character)", "bgblur(include=bogus)", "bgblur((feather=2))",
+                    "bgblur(sigma=18)", "bgblur(blur=18)", "bgblur(blur_sigma=18)", "bgblur(burn_subtitles=false)",
+                    "bgblur(feather=2)(strength=1)", "bgblur)", "bgblur(feather=2,strength=1)")
         for marker in examples:
-            with self.subTest(marker=marker), self.assertRaises(ConfigError):
-                parse_marker(marker)
+            for actor in (marker, "x3border(c1=FFFFFF;b1=9);" + marker):
+                with self.subTest(actor=actor), self.assertRaises(ConfigError):
+                    parse_marker(actor)
+
+    def test_old_brace_parameters_report_migration(self):
+        for actor in ("bgblur{strength=0.5}", "other;bgblur{feather=16;strength=0.5}"):
+            with self.subTest(actor=actor), self.assertRaisesRegex(ConfigError, "now use parentheses"):
+                parse_marker(actor)
 
 
 class ConfigurationTests(unittest.TestCase):
     def test_precedence_no_row_inheritance(self):
         cfg = resolve_config({"defaults": {"blur": 19, "feather": 7, "strength": 0.6}},
                              cli_defaults=["feather=8", "strength=0.8"], blur_sigma=20)
-        special = resolve_event_config(cfg, parse_marker("bgblur{feather=10;strength=0.5}"))
+        special = resolve_event_config(cfg, parse_marker("bgblur(feather=10;strength=0.5)"))
         normal = resolve_event_config(cfg, parse_marker("bgblur"))
         self.assertEqual(cfg.video_blur.blur_sigma, 20)
         self.assertEqual((special.feather_sigma, special.strength), (10, 0.5))
@@ -55,15 +102,15 @@ class ConfigurationTests(unittest.TestCase):
         cfg = resolve_config({"defaults": {"threshold": 0.25}, "render": {"target_height": 540}},
                              cli_defaults=["opacity_threshold=0.75"])
         normal = resolve_event_config(cfg, parse_marker("bgblur"))
-        legacy = resolve_event_config(cfg, parse_marker("bgblur{threshold=0}"))
-        empty = resolve_event_config(cfg, parse_marker("bgblur{opacity_threshold=1}"))
+        legacy = resolve_event_config(cfg, parse_marker("bgblur(threshold=0)"))
+        empty = resolve_event_config(cfg, parse_marker("bgblur(opacity_threshold=1)"))
         self.assertEqual((normal.opacity_threshold, legacy.opacity_threshold, empty.opacity_threshold), (0.75, 0, 1))
         self.assertEqual((normal.sources["opacity_threshold"], legacy.sources["opacity_threshold"]), ("cli", "actor"))
         for value in (-0.1, 1.1, float("nan"), float("inf"), True, None):
             with self.subTest(value=value), self.assertRaises(ConfigError):
                 resolve_config({"defaults": {"opacity_threshold": value}})
         with self.assertRaises(ConfigError):
-            parse_marker("bgblur{threshold=0.5;opacity_threshold=0.5}")
+            parse_marker("bgblur(threshold=0.5;opacity_threshold=0.5)")
 
     def test_burn_boolean_precedence(self):
         self.assertTrue(resolve_config().output.burn_subtitles)
@@ -82,7 +129,7 @@ class ConfigurationTests(unittest.TestCase):
             resolve_config({"selection": {"allow_merged_box": True, "grouping": "per-event"}})
 
     def test_group_is_selection_metadata_in_actor_and_sidecar(self):
-        marker = parse_marker("bgblur{group=为啥;strength=0.75}")
+        marker = parse_marker("bgblur(group=为啥;strength=0.75)")
         self.assertEqual(marker.values["group"], "为啥")
         effect = resolve_event_config(resolve_config(), marker)
         self.assertEqual(effect.strength, .75)
@@ -138,7 +185,7 @@ class ConfigurationTests(unittest.TestCase):
         cfg = resolve_config({"defaults": {"close": 99, "expand_x": 200}})
         self.assertEqual(resolve_event_config(cfg, parse_marker("bgblur")), baseline)
         with self.assertRaises(ConfigError):
-            resolve_event_config(cfg, parse_marker("bgblur{close=5}"))
+            resolve_event_config(cfg, parse_marker("bgblur(close=5)"))
 
     def test_half_up_geometric_scaling_and_encoder_alias_scope(self):
         cfg = resolve_config({"defaults": {"padding_x": 1.5, "radius": 2.49}, "encoder": {"options": {"vb": "8M"}}})
@@ -146,7 +193,7 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual((result.padding_x, result.corner_radius), (2, 2))
         self.assertEqual(cfg.encoder, {"options": {"vb": "8M"}})
         cfg = resolve_config({"render": {"target_height": 540}})
-        result = resolve_event_config(cfg, parse_marker("bgblur{padding_x=3;feather=5}"))
+        result = resolve_event_config(cfg, parse_marker("bgblur(padding_x=3;feather=5)"))
         self.assertEqual((result.padding_x, result.feather_sigma), (2, 2.5))
 
     def test_organic_defaults_overrides_scaling_and_mode_switch(self):
@@ -159,12 +206,12 @@ class ConfigurationTests(unittest.TestCase):
         cfg = resolve_config({"defaults": {"mode": "organic", "expand_x": 10, "feather": 3},
                               "render": {"target_height": 540}},
                              cli_defaults=["expand_x=5", "close=0"])
-        row = resolve_event_config(cfg, parse_marker("bgblur{expand_y=3;strength=0.7}"))
+        row = resolve_event_config(cfg, parse_marker("bgblur(expand_y=3;strength=0.7)"))
         self.assertEqual((row.expand_x, row.expand_y, row.close, row.feather_sigma), (3, 2, 0, 1.5))
         self.assertEqual((row.strength, row.opacity_threshold), (.7, .5))
         self.assertEqual((row.sources["expand_x"], row.sources["expand_y"], row.sources["feather_sigma"]),
                          ("cli", "actor", "project"))
-        box = resolve_event_config(cfg, parse_marker("bgblur{mode=box;padding_x=4}"))
+        box = resolve_event_config(cfg, parse_marker("bgblur(mode=box;padding_x=4)"))
         self.assertEqual((box.mode, box.padding_x), ("box", 2))
         self.assertEqual(box.algorithm_version, "roundrect-ss4-opacity-threshold-v2")
         self.assertEqual(resolve_event_config(cfg, parse_marker("bgblur")).mode, "organic")
@@ -172,15 +219,15 @@ class ConfigurationTests(unittest.TestCase):
     def test_organic_smoothing_presets_follow_row_mode_and_explicit_overrides(self):
         for default_mode in ("box", "organic"):
             cfg = resolve_config({"defaults": {"mode": default_mode}})
-            organic = resolve_event_config(cfg, parse_marker("bgblur{mode=organic}"))
-            box = resolve_event_config(cfg, parse_marker("bgblur{mode=box}"))
+            organic = resolve_event_config(cfg, parse_marker("bgblur(mode=organic)"))
+            box = resolve_event_config(cfg, parse_marker("bgblur(mode=box)"))
             self.assertEqual((organic.expand_x, organic.expand_y, organic.close, organic.feather_sigma),
                              (48, 36, 48, 16))
             self.assertEqual((box.padding_x, box.padding_y, box.feather_sigma), (28, 16, 12))
             self.assertEqual((organic.sources["close"], organic.sources["feather_sigma"]),
                              ("builtin", "builtin"))
         scaled = resolve_event_config(resolve_config({"render": {"target_height": 540}}),
-                                      parse_marker("bgblur{mode=organic}"))
+                                      parse_marker("bgblur(mode=organic)"))
         self.assertEqual((scaled.expand_x, scaled.expand_y, scaled.close, scaled.feather_sigma),
                          (24, 18, 24, 8))
         # Explicit values, including zero and the old default, never disappear
@@ -191,9 +238,9 @@ class ConfigurationTests(unittest.TestCase):
                     values = {"feather": feather, "close": 0}
                     project = {"defaults": values} if origin == "project" else {}
                     cli = ["feather=" + str(feather), "close=0"] if origin == "cli" else []
-                    marker = parse_marker("bgblur{mode=organic}")
+                    marker = parse_marker("bgblur(mode=organic)")
                     if origin == "actor":
-                        marker = parse_marker("bgblur{mode=organic;feather=%s;close=0}" % feather)
+                        marker = parse_marker("bgblur(mode=organic;feather=%s;close=0)" % feather)
                     if origin == "sidecar":
                         source = document("text")
                         sidecar = create_sidecar(source, [0])
@@ -212,9 +259,9 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(second.sources["padding_x"], "builtin")
         for key in ("padding_x", "padding_y", "radius"):
             with self.subTest(key=key), self.assertRaisesRegex(ConfigError, "Organic row.*Box"):
-                resolve_event_config(base, parse_marker("bgblur{%s=2}" % key))
+                resolve_event_config(base, parse_marker("bgblur(%s=2)" % key))
         with self.assertRaisesRegex(ConfigError, "Box row.*Organic"):
-            resolve_event_config(base, parse_marker("bgblur{mode=box;close=2}"))
+            resolve_event_config(base, parse_marker("bgblur(mode=box;close=2)"))
 
     def test_organic_sidecar_shape_parameters(self):
         source = document("text")
@@ -277,10 +324,10 @@ class SidecarTests(unittest.TestCase):
         data = create_sidecar(source, [0])
         data["events"][0]["overrides"] = {"strength": 0.5, "feather_sigma": 10}
         sidecar = load_sidecar(data, source)[0]
-        merged = merge_overrides(parse_marker("bgblur{strength=0.5;padding_x=20}"), sidecar)
+        merged = merge_overrides(parse_marker("bgblur(strength=0.5;padding_x=20)"), sidecar)
         self.assertEqual(merged.values, {"strength": 0.5, "padding_x": 20, "feather_sigma": 10})
         with self.assertRaises(ConfigError):
-            merge_overrides(parse_marker("bgblur{strength=0.4}"), sidecar)
+            merge_overrides(parse_marker("bgblur(strength=0.4)"), sidecar)
         for overrides in ({"sigma": 18}, {"strength": None}, {"burn_subtitles": True}):
             data["events"][0]["overrides"] = overrides
             with self.subTest(overrides=overrides), self.assertRaises(ConfigError):

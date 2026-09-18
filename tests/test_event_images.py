@@ -124,8 +124,8 @@ def test_separate_events_do_not_fill_the_empty_bridge_between_boxes():
 
 def test_explicit_group_unions_source_layers_before_constructing_one_box():
     source = source_of(
-        dialogue(rectangle(60, 70), actor="bgblur{group=layered}"),
-        dialogue(rectangle(100, 80), actor="bgblur{group=layered}", layer=1),
+        dialogue(rectangle(60, 70), actor="bgblur(group=layered)"),
+        dialogue(rectangle(100, 80), actor="bgblur(group=layered)", layer=1),
         dialogue(rectangle(420, 250)))
     with opened(source) as (session, budget), session.render(request(0)) as selected:
         assert len(selected.groups) == 2
@@ -141,8 +141,8 @@ def test_explicit_group_unions_source_layers_before_constructing_one_box():
 
 def test_distinct_simultaneous_groups_keep_independent_effect_parameters():
     source = source_of(
-        dialogue(rectangle(60, 70), actor="bgblur{strength=0.25}"),
-        dialogue(rectangle(420, 250), actor="bgblur{strength=0.75}"))
+        dialogue(rectangle(60, 70), actor="bgblur(strength=0.25)"),
+        dialogue(rectangle(420, 250), actor="bgblur(strength=0.75)"))
     with opened(source) as (session, budget), session.render(request(0)) as selected:
         assert sorted(group.effect_config.strength for group in selected.groups) == [.25, .75]
         with mask_for(selected, budget) as mask:
@@ -157,7 +157,7 @@ def test_distinct_simultaneous_groups_keep_independent_effect_parameters():
     ("alpha", "merged", False, 1),
 ])
 def test_organic_closing_is_per_group_not_across_unrelated_events(backend, grouping, named, bridge):
-    actor = "bgblur{group=joined}" if named else "bgblur"
+    actor = "bgblur(group=joined)" if named else "bgblur"
     source = source_of(dialogue(rectangle(60, 70, 20, 30), actor=actor),
                        dialogue(rectangle(84, 70, 20, 30), actor=actor))
     cfg = resolve_config({
@@ -183,8 +183,8 @@ def test_organic_and_box_coexist_with_distinct_shapes_and_parameters():
     # events. Organic retains the gap; Box intentionally fills its rectangle.
     drawing = r"{\an7\pos(%d,70)\bord0\shad0\p1}m 0 0 l 20 0 20 20 0 20 m 60 0 l 80 0 80 20 60 20"
     source = source_of(
-        dialogue(drawing % 60, actor="bgblur{mode=organic;expand_x=0;expand_y=0;close=0;strength=0.75}"),
-        dialogue(drawing % 420, actor="bgblur{strength=0.25}"))
+        dialogue(drawing % 60, actor="bgblur(mode=organic;expand_x=0;expand_y=0;close=0;strength=0.75)"),
+        dialogue(drawing % 420, actor="bgblur(strength=0.25)"))
     with opened(source) as (session, budget), session.render(request(0)) as selected:
         assert {group.effect_config.mode for group in selected.groups} == {"organic", "box"}
         with mask_for(selected, budget) as mask:
@@ -195,15 +195,15 @@ def test_organic_and_box_coexist_with_distinct_shapes_and_parameters():
 
 def test_conflicting_parameters_are_rejected_only_within_active_shared_group():
     source = source_of(
-        dialogue(rectangle(60, 70), actor="bgblur{group=same;strength=0.25}"),
-        dialogue(rectangle(100, 80), actor="bgblur{group=same;strength=0.75}"))
+        dialogue(rectangle(60, 70), actor="bgblur(group=same;strength=0.25)"),
+        dialogue(rectangle(100, 80), actor="bgblur(group=same;strength=0.75)"))
     with pytest.raises(SelectionError, match="strength"):
         prepare(source)
 
     successive = source_of(
-        dialogue(rectangle(60, 70), actor="bgblur{group=same;strength=0.25}",
+        dialogue(rectangle(60, 70), actor="bgblur(group=same;strength=0.25)",
                  end="0:00:00.04"),
-        dialogue(rectangle(100, 80), actor="bgblur{group=same;strength=0.75}",
+        dialogue(rectangle(100, 80), actor="bgblur(group=same;strength=0.75)",
                  start="0:00:00.04", end="0:00:00.08"))
     with opened(successive) as (session, _):
         strengths, identities = [], []
@@ -302,7 +302,7 @@ def test_rotated_multilayer_exclamation_does_not_expand_the_lower_sentence_box()
     lower = dialogue(rectangle(80, 290, width=480, height=25))
     layers = [dialogue(rectangle(460, 210, width=100, height=30,
                                 tags=r"\frz20\bord%d" % border),
-                       actor="bgblur{group=why}", layer=layer)
+                       actor="bgblur(group=why)", layer=layer)
               for layer, border in enumerate((5, 3, 0))]
     source = source_of(lower, *layers)
     with opened(source) as (session, budget), session.render(request(0)) as selected:

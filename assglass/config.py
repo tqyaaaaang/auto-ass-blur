@@ -1,4 +1,4 @@
-"""Configuration scopes, Actor prefix markers, and source-bound sidecars."""
+"""Configuration scopes, Actor identifier lists, and source-bound sidecars."""
 from __future__ import annotations
 
 import dataclasses
@@ -195,33 +195,68 @@ def _parse_pairs(text: str):
 
 
 def validate_prefix(prefix: str):
-    if not isinstance(prefix, str) or not prefix or any(char in prefix for char in ",{};\r\n\x00"):
-        raise ConfigError("marker_prefix must be a nonempty string without commas, braces, semicolons, or newlines")
+    # Keep the public option name, but it now denotes a complete identifier.
+    if (not isinstance(prefix, str) or not prefix
+            or any(char.isspace() or char in ",{}();=\x00" for char in prefix)):
+        raise ConfigError("marker_prefix must be a nonempty identifier without whitespace, commas, "
+                          "braces, parentheses, semicolons, equals signs, or NUL")
+
+
+def _actor_identifiers(actor: str):
+    """Split only outside parentheses; foreign parameter blocks stay opaque.
+
+    Other preprocessors may nest parentheses. Do not validate their contents or
+    mistake marker names inside them for top-level identifiers. Syntax checks
+    for our own parameter block happen after the identifier has been selected.
+    """
+    start = depth = 0
+    for index, char in enumerate(actor):
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth = max(0, depth - 1)
+        elif char == ";" and depth == 0:
+            yield actor[start:index].strip()
+            start = index + 1
+    yield actor[start:].strip()
 
 
 def parse_marker(actor: str, prefix: str = "bgblur") -> Optional[MarkerOverrides]:
-    """Case-sensitive *raw Actor* startswith; arbitrary suffixes are selected.
+    """Select an exact, case-sensitive identifier anywhere in an Actor list.
 
-    Only a brace/semicolon immediately after the prefix starts a parameter list.
-    Thus bgblurSpeaker selects defaults, but bgblur{strength=0} supplies an override.
-    Effect never participates in marker detection. Whitespace is not stripped.
+    Example: x3border(c1=FFFFFF;b1=9); bgblur(feather=16;strength=0.8).
+    Empty outer items are ignored, including a trailing semicolon. Repeated
+    markers may supply compatible overrides; conflicting values are rejected.
+    The original Actor is preserved, and Effect never participates in matching.
     """
     validate_prefix(prefix)
-    if not actor.startswith(prefix):
-        return None
-    suffix = actor[len(prefix):]
-    if suffix.startswith("{"):
-        if not suffix.endswith("}") or "{" in suffix[1:] or "}" in suffix[:-1]:
-            raise ConfigError("Malformed Actor marker parameter braces")
-        content = suffix[1:-1]
-    elif suffix.startswith(";"):
-        content = suffix[1:]
-        if not content:
-            raise ConfigError("Empty legacy marker parameter list")
-    else:
-        content = ""
-    values = normalize_overrides(_parse_pairs(content), from_text=True)
-    return MarkerOverrides(values, {key: "actor" for key in values}, actor)
+    matched = False
+    values = {}
+    for item in _actor_identifiers(actor):
+        if not item.startswith(prefix):
+            continue
+        suffix = item[len(prefix):].strip()
+        if suffix.startswith("{"):
+            raise ConfigError("Actor marker parameters now use parentheses: {}(key=value; ...), "
+                              "not braces".format(prefix))
+        if suffix.startswith("("):
+            if not suffix.endswith(")") or any(char in suffix[1:-1] for char in "()"):
+                raise ConfigError("Malformed Actor marker parameter parentheses")
+            content = suffix[1:-1].strip()
+        elif suffix.startswith(")"):
+            raise ConfigError("Malformed Actor marker parameter parentheses")
+        elif suffix:
+            # A different complete name, not an arbitrary suffix match.
+            continue
+        else:
+            content = ""
+        overrides = normalize_overrides(_parse_pairs(content), from_text=True)
+        for key, value in overrides.items():
+            if key in values and values[key] != value:
+                raise ConfigError("Conflicting repeated Actor marker parameter {!r}".format(key))
+            values[key] = value
+        matched = True
+    return MarkerOverrides(values, {key: "actor" for key in values}, actor) if matched else None
 
 
 def _merge_dict(base, updates):

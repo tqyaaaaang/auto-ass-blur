@@ -1,4 +1,5 @@
-# Actor / Name 字段区分大小写，按原字符串开头匹配。
+# Actor / Name 以括号外的分号分隔标识，区分大小写、精确匹配名称。
+# 配置项名称保留兼容；例如 x3border(c1=FFFFFF;b1=9);bgblur(strength=0.8)。
 marker_prefix: bgblur
 
 defaults:

@@ -4,7 +4,7 @@ from fractions import Fraction
 from types import SimpleNamespace
 
 from assglass.ass import SourceDocument
-from assglass.config import create_sidecar, resolve_config
+from assglass.config import ConfigError, create_sidecar, resolve_config
 from assglass.contracts import BackendCapabilities, FrameRequest, FrameSelection, ImageGroup, MaskContext, ResolvedMaskConfig
 from assglass.selection import AlphaTrackBackend, SelectionError, build_selection_plan, create_backend, register_backend
 from test_ass import HEADER, document
@@ -44,6 +44,78 @@ class SelectionPlanningTests(unittest.TestCase):
         plan = build_selection_plan(source, alpha_config(), sidecar)
         self.assertEqual(plan.target_indices, (0, 1))
 
+    def test_mixed_actor_identifiers_preserve_source_and_parameters(self):
+        actors = (
+            "x3border(5; 12; 0.3); bgblur(mode=organic; close=24; group=caption)",
+            " bgblur(mode=organic; close=24; group=caption); x3border(5; 12; 0.3); ",
+        )
+        for actor in actors:
+            with self.subTest(actor=actor):
+                source = document("标记字幕", actor=actor, bom=True, newline="\r\n")
+                original = source.raw
+                plan = build_selection_plan(source, resolve_config())
+                self.assertEqual(plan.target_indices, (0,))
+                self.assertEqual(plan.targets[0].config.mode, "organic")
+                self.assertEqual(plan.targets[0].config.close, 24)
+                self.assertEqual(plan.targets[0].group_id, "named:caption")
+                self.assertEqual(plan.targets[0].overrides.values,
+                                 {"mode": "organic", "close": 24, "group": "caption"})
+                self.assertEqual(plan.targets[0].event.actor, actor)
+                self.assertEqual(source.raw, original)
+                manifest = plan.manifest()
+                self.assertEqual(manifest["targets"][0]["actor"], actor)
+                self.assertEqual(manifest["marker_semantics"],
+                    "case-sensitive exact name in top-level semicolon-separated Actor identifiers; optional parenthesized parameters")
+
+    def test_bare_marker_can_follow_foreign_identifier_and_trailing_separator(self):
+        for actor in ("x3border;bgblur", "bgblur;x3border", "x3border(2;4); bgblur;", " bgblur; "):
+            with self.subTest(actor=actor):
+                plan = build_selection_plan(document("target", actor=actor), resolve_config())
+                self.assertEqual(plan.target_indices, (0,))
+                self.assertEqual(plan.targets[0].overrides.values, {})
+
+    def test_other_identifiers_and_effect_are_not_selected_or_validated(self):
+        actors = (
+            "bgblurred; x3border(2;4)",
+            "x3border; bgblur_suffix",
+            "x3border(bgblur; strength=invalid)",
+            "x3border(nested(bgblur); mode=unknown)",
+            "x3border; Bgblur",
+        )
+        for actor in actors:
+            with self.subTest(actor=actor):
+                source = document("ordinary", actor=actor,
+                                  effect="x3border;bgblur(mode=organic;close=24)")
+                plan = build_selection_plan(source, resolve_config())
+                self.assertEqual(plan.target_indices, ())
+        source = document("target", actor="x3border(mode=unknown; bgblur(strength=invalid)); bgblur")
+        plan = build_selection_plan(source, resolve_config())
+        self.assertEqual(plan.target_indices, (0,))
+        self.assertEqual(plan.targets[0].overrides.values, {})
+
+    def test_custom_marker_selects_exact_top_level_identifier(self):
+        source = SourceDocument.from_bytes((HEADER +
+            "Dialogue: 0,0:00:00.00,0:00:02.00,Default,bgblur; customfx_suffix,0,0,0,,ordinary\n"
+            "Dialogue: 0,0:00:00.00,0:00:02.00,Default,x3border(2;4); customfx(strength=0.5);,0,0,0,,target\n"
+            "Dialogue: 0,0:00:00.00,0:00:02.00,Default,x3border(customfx),0,0,0,,ordinary\n").encode())
+        plan = build_selection_plan(source, resolve_config(marker_prefix="customfx"))
+        self.assertEqual(plan.target_indices, (1,))
+        self.assertEqual(plan.targets[0].config.strength, 0.5)
+        self.assertEqual(plan.manifest()["marker_prefix"], "customfx")
+
+    def test_bad_marker_parameters_report_dialogue_and_physical_line(self):
+        for actor in ("x3border(2;4); bgblur(strength=invalid)",
+                      "bgblur(mode=organic; close=-1); x3border"):
+            with self.subTest(actor=actor):
+                source = document("ordinary")
+                source = SourceDocument.from_bytes(source.raw + (
+                    "\nDialogue: 0,0:00:00.00,0:00:02.00,Default,{},0,0,0,,target\n".format(actor)).encode())
+                with self.assertRaises(ConfigError) as caught:
+                    build_selection_plan(source, resolve_config())
+                self.assertTrue(str(caught.exception).startswith(
+                    "Dialogue 1 (line {}): ".format(source.events[1].line_number)))
+                self.assertRegex(str(caught.exception), "strength|close")
+
     def test_same_config_box_requires_explicit_merge(self):
         source = document("one", actor="bgblur", second="two")
         with self.assertRaisesRegex(SelectionError, "allow_merged_box"):
@@ -53,26 +125,26 @@ class SelectionPlanningTests(unittest.TestCase):
         self.assertEqual(prepared.analysis_data, source.raw)
 
     def test_effective_difference_rejected_even_when_zero_strength(self):
-        source = document("one", actor="bgblur{feather=4;strength=0}", second="two")
+        source = document("one", actor="bgblur(feather=4;strength=0)", second="two")
         with self.assertRaisesRegex(SelectionError, "feather_sigma"):
             self.preflight(source, selection={"allow_merged_box": True})
-        source = document("one", actor="bgblur{strength=0}", second="two")
+        source = document("one", actor="bgblur(strength=0)", second="two")
         with self.assertRaisesRegex(SelectionError, "strength"):
             self.preflight(source, selection={"allow_merged_box": True})
 
     def test_nonoverlap_and_end_exclusive(self):
-        raw = (HEADER + "Dialogue: 0,0:00:00.00,0:00:01.00,Default,bgblur{feather=2},0,0,0,,one\n"
-               "Dialogue: 0,0:00:01.00,0:00:02.00,Default,bgblur{feather=3},0,0,0,,two\n").encode()
+        raw = (HEADER + "Dialogue: 0,0:00:00.00,0:00:01.00,Default,bgblur(feather=2),0,0,0,,one\n"
+               "Dialogue: 0,0:00:01.00,0:00:02.00,Default,bgblur(feather=3),0,0,0,,two\n").encode()
         prepared = self.preflight(SourceDocument.from_bytes(raw))
         self.assertEqual(len(prepared.plan.targets), 2)
 
     def test_overlapping_targets_require_same_opacity_threshold(self):
-        source = document("one", actor="bgblur{threshold=0}", second="two")
+        source = document("one", actor="bgblur(threshold=0)", second="two")
         with self.assertRaisesRegex(SelectionError, "opacity_threshold"):
             self.preflight(source, selection={"allow_merged_box": True})
 
     def test_aliases_and_sources_do_not_conflict(self):
-        source = document("one", actor="bgblur{feather=12;strength=1.0}", second="two")
+        source = document("one", actor="bgblur(feather=12;strength=1.0)", second="two")
         self.preflight(source, selection={"allow_merged_box": True})
 
     def test_unsupported_backends_grouping_and_profile_binding(self):

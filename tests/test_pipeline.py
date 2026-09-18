@@ -88,8 +88,8 @@ def write_ass(path, marked=True):
     ]
     if marked:
         events += [
-            # Arbitrary suffix is intentional: Actor has startswith semantics.
-            r"Dialogue: 0,0:00:00.05,0:00:00.10,Default,bgblur_speaker,0,0,0,,BLUR TARGET",
+            # A second preprocessor keeps its own semicolon-delimited parameters.
+            r"Dialogue: 0,0:00:00.05,0:00:00.10,Default,x3border(c1=FFFFFF;b1=9); bgblur,0,0,0,,BLUR TARGET",
             r"Dialogue: 0,0:00:00.10,0:00:00.15,Default,bgblur,0,0,0,,{\alpha&HFF&}BLUR TARGET",
             r"Dialogue: 0,0:00:00.15,0:00:00.20,Default,bgblur,0,0,0,,BLUR TARGET",
         ]
@@ -131,8 +131,8 @@ def test_real_pipeline_independent_groups_keep_gap_clear(source_video, tmp_path,
     """Exercise original-track event selection through raw weights and FFmpeg."""
     ass = tmp_path / "groups.ass"
     ass.write_text(HEADER +
-        r"Dialogue: 0,0:00:00.00,0:00:00.20,Default,bgblur{group=left},0,0,0,,{\an7\pos(100,600)\bord0\shad0\p1}m 0 0 l 100 0 100 50 0 50" + "\n" +
-        r"Dialogue: 1,0:00:00.00,0:00:00.20,Default,bgblur{group=right;strength=0.5},0,0,0,,{\an7\pos(1500,300)\bord0\shad0\p1}m 0 0 l 100 0 100 50 0 50" + "\n" +
+        r"Dialogue: 0,0:00:00.00,0:00:00.20,Default,x3border(c1=FFFFFF;b1=9); bgblur(group=left),0,0,0,,{\an7\pos(100,600)\bord0\shad0\p1}m 0 0 l 100 0 100 50 0 50" + "\n" +
+        r"Dialogue: 1,0:00:00.00,0:00:00.20,Default,bgblur(group=right;strength=0.5); x3border(c1=FFFFFF;b1=9),0,0,0,,{\an7\pos(1500,300)\bord0\shad0\p1}m 0 0 l 100 0 100 50 0 50" + "\n" +
         r"Dialogue: 0,0:00:00.00,0:00:00.20,Default,narrator,0,0,0,fx,{\an7\pos(100,80)\k10}UNMARKED KARAOKE" + "\n",
         encoding="utf-8")
     output, debug = tmp_path / "groups.mp4", tmp_path / "groups.raw"
@@ -297,7 +297,7 @@ def test_invalid_per_line_sigma_fails_without_publishing_output(
 ):
     ass = tmp_path / "invalid.ass"
     ass.write_text(
-        HEADER + "Dialogue: 0,0:00:00.00,0:00:00.20,Default,bgblur{blur_sigma=18},0,0,0,,bad\n",
+        HEADER + "Dialogue: 0,0:00:00.00,0:00:00.20,Default,bgblur(blur_sigma=18),0,0,0,,bad\n",
         encoding="utf-8",
     )
     output = tmp_path / "must-not-exist.mp4"
